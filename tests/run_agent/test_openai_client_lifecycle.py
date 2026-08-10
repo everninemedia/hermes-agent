@@ -111,10 +111,55 @@ def test_stale_non_stream_close_is_single_owner(monkeypatch):
     agent = _build_agent()
     agent._compute_non_stream_stale_timeout = lambda api_payload: 0.01
 
-    with pytest.raises(APIConnectionError):
+    with pytest.raises(TimeoutError) as excinfo:
         agent._interruptible_api_call({"model": agent.model, "messages": []})
 
     assert request_client.close_calls == 1
+    assert isinstance(excinfo.value.__cause__, APIConnectionError)
+
+
+def test_concurrent_stale_timeout_does_not_relabel_peer(monkeypatch):
+    first_started = threading.Event()
+
+    def stale_responder(**kwargs):
+        first_started.set()
+        time.sleep(0.1)
+        raise _connection_error()
+
+    def healthy_responder(**kwargs):
+        assert first_started.wait(timeout=2)
+        return {"ok": "peer"}
+
+    stale_client = FakeRequestClient(stale_responder)
+    healthy_client = FakeRequestClient(healthy_responder)
+    factory = OpenAIFactory([stale_client, healthy_client])
+    monkeypatch.setattr(run_agent, "OpenAI", factory)
+
+    agent = _build_agent()
+    agent._compute_non_stream_stale_timeout = lambda payload: (
+        0.01 if payload.get("request") == "stale" else 1.0
+    )
+    results = {}
+
+    def run_call(name):
+        try:
+            results[name] = agent._interruptible_api_call(
+                {"model": agent.model, "messages": [], "request": name}
+            )
+        except Exception as exc:  # noqa: BLE001 - asserting exact type below
+            results[name] = exc
+
+    stale_thread = threading.Thread(target=run_call, args=("stale",), daemon=True)
+    healthy_thread = threading.Thread(target=run_call, args=("healthy",), daemon=True)
+    stale_thread.start()
+    assert first_started.wait(timeout=2)
+    healthy_thread.start()
+    stale_thread.join(timeout=5)
+    healthy_thread.join(timeout=5)
+
+    assert isinstance(results["stale"], TimeoutError)
+    assert isinstance(results["stale"].__cause__, APIConnectionError)
+    assert results["healthy"] == {"ok": "peer"}
 
 
 def test_closed_shared_client_is_recreated_before_request(monkeypatch):

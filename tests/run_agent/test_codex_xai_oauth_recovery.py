@@ -70,6 +70,32 @@ def _make_codex_agent():
     return agent
 
 
+def test_codex_stream_watchdog_is_scoped_to_openai_codex_backend():
+    from agent.chat_completion_helpers import _codex_stream_watchdogs_enabled
+
+    xai_agent = _make_codex_agent()
+    assert _codex_stream_watchdogs_enabled(xai_agent) is False
+
+    xai_agent.provider = "openai-codex"
+    xai_agent.base_url = "https://chatgpt.com/backend-api/codex"
+    xai_agent._base_url_lower = xai_agent.base_url.lower()
+    xai_agent._base_url_hostname = "chatgpt.com"
+    assert _codex_stream_watchdogs_enabled(xai_agent) is True
+
+
+def test_responses_protocol_alone_does_not_enable_codex_stream_watchdog():
+    from agent.chat_completion_helpers import _codex_stream_watchdogs_enabled
+
+    agent = _make_codex_agent()
+    agent.provider = "custom"
+    agent.base_url = "https://responses.example.com/v1"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "responses.example.com"
+
+    assert agent.api_mode == "codex_responses"
+    assert _codex_stream_watchdogs_enabled(agent) is False
+
+
 @pytest.mark.parametrize(
     "provider_message",
     [

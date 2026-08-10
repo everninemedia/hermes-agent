@@ -74,6 +74,10 @@ def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
     seen: list = []
     agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
     agent.api_mode = "codex_responses"
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent._base_url_lower = agent.base_url.lower()
+    agent._base_url_hostname = "chatgpt.com"
     monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 60.0)
 
     # Compress the 30s cadence: the loop fires the notice every 100 polls of

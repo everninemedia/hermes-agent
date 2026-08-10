@@ -141,6 +141,21 @@ def _is_openai_codex_backend(agent) -> bool:
     )
 
 
+def _codex_stream_watchdogs_enabled(agent) -> bool:
+    """Return whether Codex-specific stream watchdogs apply to this request.
+
+    ``codex_responses`` names the wire protocol, not the provider.  xAI and
+    other Responses-compatible providers use the same protocol but do not
+    share the ChatGPT Codex backend's silent-stream failure mode or timeout
+    budget.  They remain protected by the generic provider/reasoning-aware
+    stale-call timeout.
+    """
+    return (
+        getattr(agent, "api_mode", None) == "codex_responses"
+        and _is_openai_codex_backend(agent)
+    )
+
+
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     """Minimum wall-clock stale timeout for openai-codex by estimated context.
 
@@ -879,7 +894,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # unattended session here has the same infinite stale-retry class.
     _check_stale_giveup(agent)
 
-    request_client_holder = {"client": None, "owner_tid": None}
+    request_client_holder = {
+        "client": None,
+        "owner_tid": None,
+        "forced_timeout_error": None,
+    }
     # Transport kind of the registered request client ("openai" or
     # "anthropic_messages") so _close_request_client_once routes to the right
     # abort/close helpers (#67142).
@@ -905,7 +924,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
             request_client_holder["owner_tid"] = threading.get_ident()
         return client
 
-    def _close_request_client_once(reason: str) -> None:
+    def _close_request_client_once(
+        reason: str,
+        *,
+        forced_timeout_error: Optional[TimeoutError] = None,
+    ) -> None:
         # #29507: dispatch on the calling thread.
         #
         # When ``_call`` (the worker) reaches its ``finally`` it owns the
@@ -919,6 +942,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # BIO on the worker thread then wrote a 24-byte TLS application-data
         # record into the SQLite header (#29507).
         with request_client_lock:
+            if forced_timeout_error is not None:
+                # Record the owner of the abort BEFORE shutting down the
+                # request-local sockets.  The worker then translates only the
+                # transport error caused by this watchdog; unrelated requests
+                # and genuine network failures retain their original error.
+                request_client_holder["forced_timeout_error"] = forced_timeout_error
             request_client = request_client_holder.get("client")
             owner_tid = request_client_holder.get("owner_tid")
             stranger_thread = (
@@ -951,6 +980,24 @@ def interruptible_api_call(agent, api_kwargs: dict):
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
+    def _settle_forced_timeout_error(timeout_error: TimeoutError) -> None:
+        """Make a watchdog timeout win the worker/abort race for this request.
+
+        A transport can fail in the same poll cycle that notices the stale
+        deadline, just before the watchdog records its sentinel.  Once the
+        deadline has actually fired, preserve that low-level exception as the
+        cause but expose the actionable timeout to the caller.
+        """
+        with request_client_lock:
+            request_client_holder["forced_timeout_error"] = timeout_error
+            if result["response"] is not None:
+                return
+            previous_error = result["error"]
+            if previous_error is not None and previous_error is not timeout_error:
+                timeout_error.__cause__ = previous_error
+                timeout_error.__suppress_context__ = True
+            result["error"] = timeout_error
+
     def _call():
         try:
             # _set_request_client registers each per-request client with the
@@ -982,7 +1029,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     type(e).__name__,
                 )
                 return
-            result["error"] = e
+            with request_client_lock:
+                forced_timeout_error = request_client_holder.get(
+                    "forced_timeout_error"
+                )
+            if forced_timeout_error is not None:
+                forced_timeout_error.__cause__ = e
+                forced_timeout_error.__suppress_context__ = True
+                result["error"] = forced_timeout_error
+            else:
+                result["error"] = e
         finally:
             # Reuse reason only on a clean response; any other outcome —
             # error, or the cancel-swallow return above (which leaves both
@@ -1018,8 +1074,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # matches Codex CLI's stream_idle_timeout model: any valid SSE event is
     # activity. Operators can tune via HERMES_CODEX_TTFB_TIMEOUT_SECONDS and
     # HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS (0 disables each).
-    _codex_watchdog_enabled = agent.api_mode == "codex_responses"
     _openai_codex_backend = _is_openai_codex_backend(agent)
+    _codex_watchdog_enabled = _codex_stream_watchdogs_enabled(agent)
     _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
     if _codex_watchdog_enabled and _openai_codex_backend:
         _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
@@ -1192,8 +1248,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Reconnecting."
                 )
+            if _silent_hint:
+                _watchdog_timeout_error = TimeoutError(
+                    f"Codex stream produced no bytes within {int(_elapsed)}s "
+                    f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
+                )
+            else:
+                _watchdog_timeout_error = TimeoutError(
+                    f"Codex stream produced no bytes within {int(_elapsed)}s "
+                    f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                )
             try:
-                _close_request_client_once("codex_ttfb_kill")
+                _close_request_client_once(
+                    "codex_ttfb_kill",
+                    forced_timeout_error=_watchdog_timeout_error,
+                )
             except Exception:
                 pass
             agent._emit_wait_notice(
@@ -1205,17 +1274,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
-                    )
+            _settle_forced_timeout_error(_watchdog_timeout_error)
             break
 
         # Stream-idle detector: the Codex backend emitted at least one SSE
@@ -1242,19 +1301,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"after first byte (model: {api_kwargs.get('model', 'unknown')}). "
                 f"Reconnecting."
             )
+            _watchdog_timeout_error = TimeoutError(
+                f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
+                f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
+            )
             try:
-                _close_request_client_once("codex_stream_idle_kill")
+                _close_request_client_once(
+                    "codex_stream_idle_kill",
+                    forced_timeout_error=_watchdog_timeout_error,
+                )
             except Exception:
                 pass
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
-                    f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
-                )
+            _settle_forced_timeout_error(_watchdog_timeout_error)
             break
 
         # Stale-call detector: kill the connection if no response
@@ -1270,11 +1332,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _report_stale_nonstream_kill(
                 agent, api_kwargs, _elapsed, _stale_timeout, hint=_silent_hint
             )
+            if _silent_hint:
+                _watchdog_timeout_error = TimeoutError(
+                    f"Non-streaming API call timed out after {int(_elapsed)}s "
+                    f"with no response (threshold: {int(_stale_timeout)}s). "
+                    f"{_silent_hint}"
+                )
+            else:
+                _watchdog_timeout_error = TimeoutError(
+                    f"Non-streaming API call timed out after {int(_elapsed)}s "
+                    f"with no response (threshold: {int(_stale_timeout)}s)"
+                )
             try:
                 # #67142: routes by client kind — anthropic now aborts the
                 # request-local client's sockets from this poll (stranger)
                 # thread instead of closing the shared _anthropic_client.
-                _close_request_client_once("stale_call_kill")
+                _close_request_client_once(
+                    "stale_call_kill",
+                    forced_timeout_error=_watchdog_timeout_error,
+                )
             except Exception:
                 pass
             # Circuit breaker (#58962): count the stale kill.  See the
@@ -1283,18 +1359,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
-                        f"{_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
+            _settle_forced_timeout_error(_watchdog_timeout_error)
             break
 
         if agent._interrupt_requested:
