@@ -111,6 +111,24 @@ def test_routing_resolution_failure_falls_back_to_parent():
     assert rt["provider"] == "openai-codex"
 
 
+def test_routing_resolution_failure_is_fail_closed_when_configured():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {
+        "provider": "openrouter",
+        "model": "google/gemini-3-flash-preview",
+        "fail_closed": True,
+    }}}
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               side_effect=RuntimeError("boom")):
+        try:
+            br._resolve_review_runtime(agent)
+        except RuntimeError as exc:
+            assert "fail_closed" in str(exc)
+        else:
+            raise AssertionError("fail_closed routing failure must not reuse the parent model")
+
+
 # ---------------------------------------------------------------------------
 # _digest_history — routed-path compact replay
 # ---------------------------------------------------------------------------

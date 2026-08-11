@@ -304,6 +304,7 @@ auxiliary:
   background_review:
     provider: openrouter
     model: google/gemini-3-flash-preview   # auto (default) = main chat model
+    fail_closed: false                     # true = never fall back to the main model if this lane cannot resolve
 ```
 
 When you point it at a model **different** from your main one, the review runs
@@ -316,6 +317,11 @@ identical and skill capture near-identical to the main-model review.
 
 Leave it at `auto` (or set it to your main model) and nothing changes — the
 review keeps running on the main model with the full warm-cache replay.
+
+Set `fail_closed: true` when the auxiliary route exists specifically to protect
+the main model's budget. If the configured provider or model cannot be
+resolved, Hermes then skips the background review and reports the auxiliary
+failure instead of silently replaying the review on the main model.
 
 ## Controlling skill writes (`skills.write_approval`)
 

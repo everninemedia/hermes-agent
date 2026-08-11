@@ -1088,6 +1088,10 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 120,
             "extra_body": {},
+            # Abort a configured auxiliary lane on resolution failure instead
+            # of silently spending the main model's budget. Default false
+            # preserves existing installations.
+            "fail_closed": False,
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
         "moa_reference": {

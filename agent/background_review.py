@@ -81,6 +81,7 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
     task_api_key = (str(task.get("api_key", "")).strip() or None)
+    task_fail_closed = bool(task.get("fail_closed", False))
     if not (task_provider and task_provider != "auto" and task_model):
         return parent
     if task_provider == (agent.provider or "") and task_model == (agent.model or ""):
@@ -107,6 +108,10 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "routed": True,
         }
     except Exception as e:
+        if task_fail_closed:
+            raise RuntimeError(
+                "background-review auxiliary routing failed while fail_closed is enabled"
+            ) from e
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent
 
