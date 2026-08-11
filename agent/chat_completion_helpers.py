@@ -2309,6 +2309,97 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
+_TOOL_ROUTING_KEYS = ("tools", "tool_choice", "parallel_tool_calls")
+
+
+def _force_toolless_request(request: dict) -> dict:
+    """Return a copy with every tool-routing field removed.
+
+    A max-iteration summary is deliberately text-only.  Responses transports
+    normally add ``tool_choice=auto`` and ``parallel_tool_calls=true`` whenever
+    the agent has tools.  Removing only ``tools`` leaves an invalid request
+    that xAI and other strict gateways reject with HTTP 400.  Keep the coupled
+    fields atomic at this final chokepoint, including profile-provided fields
+    nested in ``extra_body``.
+    """
+    sanitized = dict(request)
+    for key in _TOOL_ROUTING_KEYS:
+        sanitized.pop(key, None)
+    extra_body = sanitized.get("extra_body")
+    if isinstance(extra_body, dict):
+        clean_extra = dict(extra_body)
+        for key in _TOOL_ROUTING_KEYS:
+            clean_extra.pop(key, None)
+        if clean_extra:
+            sanitized["extra_body"] = clean_extra
+        else:
+            sanitized.pop("extra_body", None)
+    return sanitized
+
+
+def _local_iteration_checkpoint(messages: list, max_iterations: int, error: Exception) -> str:
+    """Build a useful, provider-independent fallback when summary generation fails."""
+
+    def _visible_text(content: Any) -> str:
+        if isinstance(content, str):
+            visible = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+            # A truncated provider stream may leave a reasoning block open.
+            # Preserve only text before that block; never surface its payload.
+            open_think = visible.find("<think>")
+            if open_think >= 0:
+                visible = visible[:open_think]
+            return visible.strip()
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in {
+                "text",
+                "output_text",
+            }:
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts)
+
+    last_progress = ""
+    tool_names: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            visible = _visible_text(msg.get("content"))
+            if visible:
+                last_progress = visible
+            for call in msg.get("tool_calls") or []:
+                try:
+                    name = str((call.get("function") or {}).get("name") or "").strip()
+                except AttributeError:
+                    name = ""
+                if name:
+                    tool_names.append(name)
+    if len(last_progress) > 2400:
+        last_progress = last_progress[-2400:]
+    unique_tools = list(dict.fromkeys(tool_names))[-12:]
+    parts = [
+        f"Iteration limit reached ({max_iterations}). The provider summary failed, "
+        "but Hermes preserved the session state.",
+    ]
+    if last_progress:
+        parts.extend(["Last recorded progress:", last_progress])
+    if unique_tools:
+        parts.append(
+            "Recorded tool activity: "
+            + ", ".join(unique_tools)
+            + f" ({len(tool_names)} calls total)."
+        )
+    parts.append(
+        f"Summary failure class: {type(error).__name__}. Resume this session to continue."
+    )
+    return "\n\n".join(parts)
+
+
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     agent._safe_print(
@@ -2460,8 +2551,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             summary_extra_body["tags"] = _portal_tags()
 
         if agent.api_mode == "codex_responses":
-            codex_kwargs = agent._build_api_kwargs(api_messages)
-            codex_kwargs.pop("tools", None)
+            codex_kwargs = _force_toolless_request(
+                agent._build_api_kwargs(api_messages, tools_for_api=[])
+            )
             summary_response = agent._run_codex_stream(codex_kwargs)
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
@@ -2529,6 +2621,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
 
+            summary_kwargs = _force_toolless_request(summary_kwargs)
+
             if agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(
@@ -2542,6 +2636,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     base_url=getattr(agent, "_anthropic_base_url", None),
                 )
                 _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
+                _ant_kw = _force_toolless_request(_ant_kw)
                 summary_response = _managed_summary_call(
                     _ant_kw,
                     agent._anthropic_messages_create,
@@ -2569,11 +2664,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 messages.append({"role": "assistant", "content": final_response})
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
+                messages.append({"role": "assistant", "content": final_response})
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
-                codex_kwargs = agent._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
+                codex_kwargs = _force_toolless_request(
+                    agent._build_api_kwargs(api_messages, tools_for_api=[])
+                )
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
@@ -2591,6 +2688,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     base_url=getattr(agent, "_anthropic_base_url", None),
                 )
                 _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
+                _ant_kw2 = _force_toolless_request(_ant_kw2)
                 retry_response = _managed_summary_call(
                     _ant_kw2,
                     agent._anthropic_messages_create,
@@ -2612,6 +2710,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                summary_kwargs = _force_toolless_request(summary_kwargs)
+
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )
@@ -2631,12 +2731,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     messages.append({"role": "assistant", "content": final_response})
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
+                    messages.append({"role": "assistant", "content": final_response})
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
+                messages.append({"role": "assistant", "content": final_response})
 
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = _local_iteration_checkpoint(
+            messages, agent.max_iterations, e
+        )
+        messages.append({"role": "assistant", "content": final_response})
     finally:
         from agent import relay_llm
 

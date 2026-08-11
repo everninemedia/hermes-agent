@@ -161,6 +161,41 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
     "awaiting your next message."
 )
 
+# Keep enough room to stop exploring and close the turn before the hard cap.
+# The nudge is request-local (not persisted). Tools remain registered because
+# strict providers may reject replayed tool_use/tool_result history when the
+# matching definitions disappear. The independent max-iteration summary is
+# forced text-only at its own request chokepoint.
+_ITERATION_CLOSEOUT_NUDGE_AFTER_CALLS = 6
+
+
+def _iteration_closeout_policy(api_call_count: int, max_iterations: int) -> tuple[bool, int]:
+    remaining_after_call = max(0, int(max_iterations) - int(api_call_count))
+    if int(max_iterations) <= _ITERATION_CLOSEOUT_NUDGE_AFTER_CALLS * 2:
+        return False, remaining_after_call
+    return remaining_after_call <= _ITERATION_CLOSEOUT_NUDGE_AFTER_CALLS, remaining_after_call
+
+
+def _append_iteration_closeout_nudge(
+    api_messages: list[dict], *, remaining_after_call: int
+) -> None:
+    nudge = (
+        "[Hermes iteration-budget closeout]\n"
+        f"Only {remaining_after_call} provider calls remain after this one. "
+        "Stop new exploration. Use only the minimum remaining tool calls needed "
+        "to make the current state safe, then return the best honest final text "
+        "with completed work, concrete paths/commits, and open items before the cap."
+    )
+    if (
+        api_messages
+        and api_messages[-1].get("role") == "user"
+        and isinstance(api_messages[-1].get("content"), str)
+    ):
+        api_messages[-1] = dict(api_messages[-1])
+        api_messages[-1]["content"] = api_messages[-1]["content"].rstrip() + "\n\n" + nudge
+    else:
+        api_messages.append({"role": "user", "content": nudge})
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -2107,6 +2142,14 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
+        _closeout_nudge, _remaining_after_call = (
+            _iteration_closeout_policy(api_call_count, agent.max_iterations)
+        )
+        if _closeout_nudge:
+            _append_iteration_closeout_nudge(
+                api_messages,
+                remaining_after_call=_remaining_after_call,
+            )
         tools_for_api = agent.tools
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
