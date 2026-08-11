@@ -12,7 +12,8 @@ import sys
 import threading
 import time
 
-from concurrent.futures.thread import _threads_queues
+import pytest
+from concurrent.futures.thread import BrokenThreadPool, _threads_queues
 
 from tools.daemon_pool import DaemonThreadPoolExecutor
 
@@ -38,6 +39,44 @@ def test_idle_worker_reuse():
         time.sleep(0.05)  # let the worker park on the idle semaphore
         tid2 = pool.submit(threading.get_ident).result(timeout=10)
         assert tid1 == tid2
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_initializer_runs_once_in_each_worker_with_initargs():
+    lock = threading.Lock()
+    initialized = []
+    release = threading.Barrier(4)
+
+    def initializer(marker):
+        with lock:
+            initialized.append((threading.get_ident(), marker))
+
+    pool = DaemonThreadPoolExecutor(
+        max_workers=4,
+        initializer=initializer,
+        initargs=("ready",),
+    )
+    try:
+        futures = [pool.submit(release.wait) for _ in range(4)]
+        assert all(f.result(timeout=10) >= 0 for f in futures)
+        assert len(initialized) == 4
+        assert len({thread_id for thread_id, _ in initialized}) == 4
+        assert {marker for _, marker in initialized} == {"ready"}
+        assert len(pool._threads) <= 4
+        assert all(thread.daemon for thread in pool._threads)
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_initializer_failure_breaks_pool():
+    def broken_initializer():
+        raise RuntimeError("initializer boom")
+
+    pool = DaemonThreadPoolExecutor(max_workers=1, initializer=broken_initializer)
+    try:
+        with pytest.raises(BrokenThreadPool):
+            pool.submit(lambda: None).result(timeout=10)
     finally:
         pool.shutdown(wait=True)
 
