@@ -2777,10 +2777,25 @@ class TestHandleMaxIterations:
         with patch("agent.relay_llm.complete_logical_call") as complete_logical:
             result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
-        assert "error" in result.lower()
-        assert "API down" in result
+        assert "preserved the session state" in result
+        assert "Exception" in result
+        assert "API down" not in result
+        assert messages[-1] == {"role": "assistant", "content": result}
         complete_logical.assert_called_once()
         assert complete_logical.call_args.kwargs == {"outcome": "failed"}
+
+    def test_empty_summary_retry_persists_assistant_fallback(self, agent):
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content=""),
+            _mock_response(content=""),
+        ]
+        agent._cached_system_prompt = "You are helpful."
+        messages = [{"role": "user", "content": "do stuff"}]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "I reached the iteration limit and couldn't generate a summary."
+        assert messages[-1] == {"role": "assistant", "content": result}
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -2815,6 +2830,9 @@ class TestHandleMaxIterations:
 
         assert result == "Summary of work done."
         kwargs = agent.client.chat.completions.create.call_args.kwargs
+        assert "tools" not in kwargs
+        assert "tool_choice" not in kwargs
+        assert "parallel_tool_calls" not in kwargs
         sent_msgs = kwargs.get("messages", [])
         orphan_ids = [
             m.get("tool_call_id") for m in sent_msgs
@@ -2898,12 +2916,51 @@ class TestHandleMaxIterations:
             result = agent._handle_max_iterations(messages, 90)
 
         assert result == "Summary"
+        assert "tools" not in captured
+        assert "tool_choice" not in captured
+        assert "parallel_tool_calls" not in captured
         input_items = captured["input"]
         assert not any(
             item.get("type") == "function_call_output"
             and item.get("call_id") == "call_orphan"
             for item in input_items
         )
+
+    def test_codex_summary_retry_is_toolless_on_both_attempts(self, agent):
+        agent.api_mode = "codex_responses"
+        agent.provider = "xai"
+        agent.base_url = "https://api.x.ai/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.x.ai"
+        agent.model = "grok-4.6"
+        agent._cached_system_prompt = "You are helpful."
+        captured = []
+
+        def fake_run_codex_stream(kwargs):
+            captured.append(dict(kwargs))
+            text = "" if len(captured) == 1 else "Recovered summary"
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ],
+            )
+
+        with patch.object(agent, "_run_codex_stream", side_effect=fake_run_codex_stream):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 36
+            )
+
+        assert result == "Recovered summary"
+        assert len(captured) == 2
+        for request in captured:
+            assert "tools" not in request
+            assert "tool_choice" not in request
+            assert "parallel_tool_calls" not in request
 
     def test_api_sanitizer_matches_responses_call_id_when_id_differs(self, agent):
         messages = [
