@@ -58,6 +58,31 @@ class TestScanSkillCommands:
 
 
 
+    def test_get_skill_commands_rescans_when_active_home_changes(self, tmp_path, monkeypatch):
+        """A long-lived process must not keep the first profile's skills."""
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+
+        evm_home = tmp_path / "evm"
+        content_home = tmp_path / "content"
+        _make_skill(evm_home / "skills", "evm-only")
+        _make_skill(content_home / "skills", "content-only")
+
+        monkeypatch.setenv("HERMES_HOME", str(evm_home))
+        with (
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+        ):
+            evm_commands = dict(get_skill_commands())
+
+            monkeypatch.setenv("HERMES_HOME", str(content_home))
+            content_commands = dict(get_skill_commands())
+
+        assert "/evm-only" in evm_commands
+        assert "/content-only" not in evm_commands
+        assert "/content-only" in content_commands
+        assert "/evm-only" not in content_commands
+
     def test_loads_skill_invocation_from_symlinked_skill_dir(self, tmp_path):
         """Slash commands should load skills symlinked under the local skills dir."""
         external_root = tmp_path / "external"
