@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_root: Optional[str] = None
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -207,6 +208,22 @@ def _resolve_skill_commands_platform() -> Optional[str]:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
 
+
+def _resolve_skill_commands_root() -> Optional[str]:
+    """Return the live skills root used to scope the slash-command cache.
+
+    ``tools.skills_tool`` deliberately resolves its skills directory at call
+    time so a long-lived backend can follow a profile switch.  Keep the
+    command cache in the same scope; otherwise the first profile to scan wins.
+    """
+    try:
+        from tools.skills_tool import _skills_dir
+
+        return str(_skills_dir())
+    except Exception:
+        return None
+
+
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -214,7 +231,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     try:
-        from tools.skills_tool import SKILLS_DIR, skill_view
+        from tools.skills_tool import _skills_dir, skill_view
         from agent.skill_utils import normalize_skill_lookup_name
 
         normalized = normalize_skill_lookup_name(raw_identifier)
@@ -240,7 +257,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         skill_dir = Path(abs_skill_dir)
     elif skill_path:
         try:
-            skill_dir = SKILLS_DIR / Path(skill_path).parent
+            skill_dir = _skills_dir() / Path(skill_path).parent
         except Exception:
             skill_dir = None
 
@@ -295,7 +312,7 @@ def _build_skill_message(
     session_id: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
+    from tools.skills_tool import _skills_dir
 
     content = str(loaded_skill.get("content") or "")
 
@@ -364,7 +381,7 @@ def _build_skill_message(
 
     if supporting and skill_dir:
         try:
-            skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
+            skill_view_target = str(skill_dir.relative_to(_skills_dir()))
         except ValueError:
             # Skill is from an external dir — use the skill name instead
             skill_view_target = skill_dir.name
@@ -405,11 +422,12 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
+    global _skill_commands, _skill_commands_platform, _skill_commands_root
     _skill_commands_platform = _resolve_skill_commands_platform()
+    _skill_commands_root = _resolve_skill_commands_root()
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
@@ -417,8 +435,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         # Scan local dir first, then external dirs
         dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            dirs_to_scan.append(active_skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
@@ -498,13 +517,13 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty).
 
-    Rescans when the active platform scope changes (e.g. a gateway
-    process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
+    Rescans when the active platform or profile skills root changes so each
+    scope sees its own ``skills.platform_disabled`` view and skill directory.
     """
     if (
         not _skill_commands
         or _skill_commands_platform != _resolve_skill_commands_platform()
+        or _skill_commands_root != _resolve_skill_commands_root()
     ):
         scan_skill_commands()
     return _skill_commands

@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
 import { queryClient } from '@/lib/query-client'
-import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
+import { cachedSlashCompletion, invalidateSlashCompletions } from '@/lib/slash-completion-cache'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { isSkillItem } from '../composer-utils'
 
@@ -74,6 +75,7 @@ async function completions(api: { search: (query: string) => readonly Unstable_T
 afterEach(() => {
   cleanup()
   queryClient.clear()
+  $activeGatewayProfile.set('default')
 })
 
 describe('useSlashCompletions', () => {
@@ -93,6 +95,28 @@ describe('useSlashCompletions', () => {
     await act(async () => invalidateSlashCompletions())
     await completions(api, '')
     expect(request).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not reuse an in-flight catalog after a profile switch', async () => {
+    let resolveEvm!: (value: typeof CATALOG) => void
+    const evmCatalog = new Promise<typeof CATALOG>(resolve => {
+      resolveEvm = resolve
+    })
+    const contentCatalog = {
+      categories: [],
+      pairs: [['/content-loop', 'Run the content loop']]
+    }
+
+    $activeGatewayProfile.set('evm')
+    const evmRequest = cachedSlashCompletion('catalog', () => evmCatalog)
+
+    $activeGatewayProfile.set('content')
+    const contentRequest = cachedSlashCompletion('catalog', () => Promise.resolve(contentCatalog))
+
+    resolveEvm(CATALOG)
+
+    await expect(evmRequest).resolves.toEqual(CATALOG)
+    await expect(contentRequest).resolves.toEqual(contentCatalog)
   })
 
   it('offers skill commands on a bare slash, not just built-ins', async () => {
