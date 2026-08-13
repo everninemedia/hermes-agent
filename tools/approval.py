@@ -908,6 +908,11 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    # Publishing or merging normal Git history is intentional work, but must
+    # remain a human-confirmed action in interactive sessions.  Keep these
+    # after the force-push rules so their more specific explanation wins.
+    (_CMDPOS + r'git(?:\s+(?:--?[^\s]+(?:\s+\S+)?))*\s+push(?:\s|$)', "git push (publishes commits to a remote)"),
+    (_CMDPOS + r'git(?:\s+(?:--?[^\s]+(?:\s+\S+)?))*\s+merge(?:\s|$)', "git merge (changes the current branch)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
     # `-D` is shorthand for `-d --force`; the long-flag spellings
