@@ -425,11 +425,28 @@ describe('settled tool run', () => {
     })
     expect(container.querySelector('[data-tool-summary]')).toBeNull()
   })
+
+  it('keeps a lone file read folded until its row is opened', async () => {
+    const { container } = render(<GroupHarness message={completedOnlyMessage()} />)
+
+    const rowToggle = await waitFor(() => {
+      const toggle = container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+
+      expect(toggle).not.toBeNull()
+
+      return toggle as Element
+    })
+
+    expect(screen.queryByText('127.0.0.1 localhost')).toBeNull()
+
+    fireEvent.click(rowToggle)
+
+    expect(await screen.findByText('127.0.0.1 localhost')).toBeTruthy()
+  })
 })
 
-// A diff is what the user reviews, so it is never what gets summarized away.
-// It stays on screen at the point in the turn where it happened, with the
-// activity either side of it collapsing around it.
+// A diff stays at the point in the turn where it happened, with the activity
+// either side collapsed. Its potentially large body is folded by default.
 describe('a file edit among ordinary activity', () => {
   it('stays visible between the two runs it interrupted', async () => {
     const { container } = render(<GroupHarness message={editBetweenRunsMessage()} />)
@@ -443,12 +460,24 @@ describe('a file edit among ordinary activity', () => {
     expect(shape).toEqual(['summary', 'row', 'summary'])
   })
 
-  it('keeps the diff itself on screen rather than behind the summary', async () => {
+  it('keeps the diff card visible but its body folded until opened', async () => {
     const { container } = render(<GroupHarness message={editBetweenRunsMessage()} />)
 
-    await waitFor(() => {
-      expect(container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull()
+    const rowToggle = await waitFor(() => {
+      const toggle = container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+
+      expect(toggle).not.toBeNull()
+
+      return toggle as Element
     })
+
+    expect(container.querySelector('[data-tool-row][data-tool-open]')).toBeNull()
+    expect(screen.queryByText('added line')).toBeNull()
+
+    fireEvent.click(rowToggle)
+
+    await waitFor(() => expect(container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull())
+    expect(await screen.findByText('added line')).toBeTruthy()
   })
 })
 
