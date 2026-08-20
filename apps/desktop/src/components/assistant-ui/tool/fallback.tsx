@@ -369,8 +369,10 @@ function ToolEntry({ part }: ToolEntryProps) {
   const sideDiff = useStore($toolInlineDiff(toolCallId ?? ''))
   const inlineDiff = stripInlineDiffChrome(sideDiff) || inlineDiffFromResult(result)
   const isFileEdit = isFileEditTool(toolName)
-  const defaultOpen = Boolean(inlineDiff)
-  const open = useDisclosureOpen(disclosureId, defaultOpen)
+  // File contents and diffs are reference material in the transcript. Keep
+  // them folded on first render just like settled activity runs; the user can
+  // still open a specific row when they want to inspect it.
+  const open = useDisclosureOpen(disclosureId)
   const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively
   // streaming — historical sessions mount with `messageRunning === false`,
