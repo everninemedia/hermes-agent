@@ -462,10 +462,10 @@ describe('settled tool run', () => {
   })
 
   it('keeps a lone file read folded until its row is opened', async () => {
-    const { container } = render(<GroupHarness message={completedOnlyMessage()} />)
+    const first = render(<GroupHarness message={completedOnlyMessage()} />)
 
     const rowToggle = await waitFor(() => {
-      const toggle = container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+      const toggle = first.container.querySelector('[data-tool-row] button[aria-expanded="false"]')
 
       expect(toggle).not.toBeNull()
 
@@ -477,6 +477,11 @@ describe('settled tool run', () => {
     fireEvent.click(rowToggle)
 
     expect(await screen.findByText('127.0.0.1 localhost')).toBeTruthy()
+
+    first.unmount()
+    render(<GroupHarness message={completedOnlyMessage()} />)
+
+    expect(screen.queryByText('127.0.0.1 localhost')).toBeNull()
   })
 })
 
@@ -513,6 +518,27 @@ describe('a file edit among ordinary activity', () => {
 
     await waitFor(() => expect(container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull())
     expect(await screen.findByText('added line')).toBeTruthy()
+  })
+
+  it('folds an explicitly opened diff again when history remounts', async () => {
+    const first = render(<GroupHarness message={editBetweenRunsMessage()} />)
+
+    const rowToggle = await waitFor(() => {
+      const toggle = first.container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+
+      expect(toggle).not.toBeNull()
+
+      return toggle as Element
+    })
+
+    fireEvent.click(rowToggle)
+    expect(await screen.findByText('added line')).toBeTruthy()
+
+    first.unmount()
+    const second = render(<GroupHarness message={editBetweenRunsMessage()} />)
+
+    expect(second.container.querySelector('[data-tool-row][data-tool-open]')).toBeNull()
+    expect(screen.queryByText('added line')).toBeNull()
   })
 })
 
