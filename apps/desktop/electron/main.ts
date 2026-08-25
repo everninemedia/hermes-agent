@@ -86,6 +86,7 @@ import {
   BROWSER_WINDOW_WIDTH,
   buildBrowserWindowUrl
 } from './browser-windows'
+import { BudgetMeasureService } from './budget-measure-service'
 import { detectBundleSkew } from './bundle-skew'
 import { applyConnectionChange, teardownSshState } from './connection-apply'
 import {
@@ -1378,6 +1379,7 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let budgetMeasureService: BudgetMeasureService | null = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -6369,6 +6371,8 @@ function sendOpenFolderRequested() {
 // renderer's WebSocket to the local backend; the renderer reconnects on this
 // signal so the chat composer doesn't stay stuck on "Starting Hermes...".
 function sendPowerResume() {
+  budgetMeasureService?.onWake()
+
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
   }
@@ -16507,6 +16511,8 @@ app.on('before-quit', () => {
     translucencyWriteTimer = null
     writePersistedTranslucency(translucencyState)
   }
+
+  void budgetMeasureService?.stop()
 })
 
 // Close the pooled keep-alive sockets on quit so lingering connections can't
@@ -17376,6 +17382,15 @@ app.whenReady().then(() => {
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
+  budgetMeasureService = new BudgetMeasureService({
+    appDataPath: app.getPath('userData'),
+    BrowserWindow,
+    fromPartition: partition => session.fromPartition(partition),
+    logger: message => rememberLog(message)
+  })
+  void budgetMeasureService.start().catch(error => {
+    rememberLog(`[budget] D1-RPC konnte nicht starten: ${String(error)}`)
+  })
   keepAwake.set(readPersistedKeepAwake())
   f12Blocked = readPersistedDisableF12()
   // Seed this before the first window exists: a picker can open before
