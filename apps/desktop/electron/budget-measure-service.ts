@@ -156,10 +156,22 @@ const PROVIDER_EXTRACT_JS: Record<ProviderId, string> = {
     return { accountMarker: value.slice(0, 80) }
   })()`,
   codex: `(() => {
-    const el = document.querySelector('[data-testid="profile-button"], [data-testid*="profile" i], button[aria-label*="profile" i]')
-    const value = el ? String(el.innerText || el.textContent || '').trim() : ''
-    const match = value.match(/\b(pro|plus|team|enterprise)\b/i)
-    return { planBadge: match ? match[1].toUpperCase() : '' }
+    const candidates = Array.from(document.querySelectorAll('[data-testid*="profile" i], [data-testid*="account" i], button[aria-label*="profile" i], button[aria-label*="konto" i], button[aria-label*="account" i], img[alt*="@"]'))
+    let badge = ''
+    for (const el of candidates) {
+      const value = [String(el.innerText || el.textContent || ''), String(el.getAttribute('aria-label') || ''), String(el.getAttribute('alt') || '')].join(' ')
+      const match = value.match(/\b(pro|plus|team|enterprise|business|free)\b/i)
+      if (match) { badge = match[1].toUpperCase(); break }
+    }
+    if (!badge) {
+      const badgeEl = Array.from(document.querySelectorAll('span,div,a,button')).find(el => {
+        if (el.children.length) { return false }
+        const value = String(el.textContent || '').trim().toLowerCase()
+        return ['free', 'pro', 'plus', 'team', 'business', 'enterprise'].includes(value)
+      })
+      if (badgeEl) { badge = String(badgeEl.textContent || '').trim().toUpperCase() }
+    }
+    return { planBadge: badge }
   })()`,
   grok: `(() => {
     const heading = Array.from(document.querySelectorAll('h1,h2,h3,h4')).find(el => /SuperGrok.*-?Limit/i.test((el.textContent || '').trim()))
@@ -178,11 +190,13 @@ const PROVIDER_EXTRACT_JS: Record<ProviderId, string> = {
       const label = String(el.previousElementSibling && el.previousElementSibling.textContent || '').trim()
       if (label) breakdown.push({ label: label.slice(0, 120), pct: match[1] })
     })
-    const handle = Array.from(document.querySelectorAll('button,a,[role="button"]'))
-      .map(el => String(el.innerText || el.textContent || '').trim())
-      .find(value => /^@[A-Za-z0-9_]{2,}$/.test(value)) || ''
+    const handle = Array.from(document.querySelectorAll('button,a,[role="button"],img,[data-testid]'))
+      .map(el => [String(el.innerText || el.textContent || ''), String(el.getAttribute('aria-label') || ''), String(el.getAttribute('title') || ''), String(el.getAttribute('alt') || '')].join(' ').trim())
+      .find(value => /@[A-Za-z0-9_]{2,}/.test(value)) || ''
+    const handleMatch = handle.match(/@[A-Za-z0-9_]{2,}/)
+    const handleValue = handleMatch ? handleMatch[0] : ''
     return {
-      handle,
+      handle: handleValue,
       aria: flow ? flow.getAttribute('aria-label') : null,
       breakdown,
       text: box ? String(box.innerText || '').slice(0, 2000) : '',
@@ -634,6 +648,21 @@ export class BudgetMeasureService {
     }
   }
 
+  private usageCardProof(text: unknown): boolean {
+    const value = String(text || '')
+
+    if (!value) {return false}
+
+    const patterns = [
+      /w(?:ö|oe)chentliches nutzungslimit[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}verbleibend/i,
+      /supergrok[\s\S]{0,60}?limit[\s\S]{0,40}(?:gebraucht|used)/i,
+      /w(?:ö|oe)chentliche quote[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}gebraucht/i,
+      /all models?[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}used/i
+    ]
+
+    return patterns.some(pattern => pattern.test(value))
+  }
+
   private failure(status: ProviderStatus, detail: string): BudgetMeasureProviderResult {
     return { status, observed_at: null, detail: redactBudgetOutput(detail).slice(0, 400) }
   }
@@ -821,13 +850,14 @@ export class BudgetMeasureService {
       extracted = {}
     }
 
+    const cardProof = this.usageCardProof(state?.text)
     const requiredEvidence = provider === 'zai'
-      ? Boolean(extracted.accountAvatar)
+      ? Boolean(extracted.accountAvatar) || cardProof
       : provider === 'claude'
-        ? Boolean(extracted.accountMarker)
+        ? Boolean(extracted.accountMarker) || cardProof
         : provider === 'codex'
-          ? Boolean(extracted.planBadge)
-          : /^@[A-Za-z0-9_]{2,}$/.test(String(extracted.handle || ''))
+          ? Boolean(extracted.planBadge) || cardProof
+          : /^@[A-Za-z0-9_]{2,}$/.test(String(extracted.handle || '')) || cardProof
 
     if (!requiredEvidence) {
       return this.failure('structure_unknown', 'Konto-Nachweis im Messfenster fehlt')
