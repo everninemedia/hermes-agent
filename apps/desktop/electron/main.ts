@@ -58,6 +58,7 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { BudgetMeasureService } from './budget-measure-service'
 import { detectBundleSkew } from './bundle-skew'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
@@ -1259,6 +1260,7 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+let budgetMeasureService: BudgetMeasureService | null = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -5855,6 +5857,8 @@ function sendOpenFolderRequested() {
 // renderer's WebSocket to the local backend; the renderer reconnects on this
 // signal so the chat composer doesn't stay stuck on "Starting Hermes...".
 function sendPowerResume() {
+  budgetMeasureService?.onWake()
+
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
   }
@@ -13790,6 +13794,8 @@ app.on('before-quit', () => {
     translucencyWriteTimer = null
     writePersistedTranslucency(translucencyState)
   }
+
+  void budgetMeasureService?.stop()
 })
 
 ipcMain.on('hermes:translucency', (_event, payload) => {
@@ -15117,6 +15123,15 @@ app.whenReady().then(() => {
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
+  budgetMeasureService = new BudgetMeasureService({
+    appDataPath: app.getPath('userData'),
+    BrowserWindow,
+    fromPartition: partition => session.fromPartition(partition),
+    logger: message => rememberLog(message)
+  })
+  void budgetMeasureService.start().catch(error => {
+    rememberLog(`[budget] D1-RPC konnte nicht starten: ${String(error)}`)
+  })
   keepAwake.set(readPersistedKeepAwake())
   f12Blocked = readPersistedDisableF12()
   // Quick Entry's global chord — registered on ready so a cold launch restores
