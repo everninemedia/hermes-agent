@@ -8973,18 +8973,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Read the persisted runtime route off a session row dict.
 
         Accepts the dict returned by ``get_session`` (``model_config`` is a
-        JSON string) or an already-parsed dict. Prefers the nested
-        ``gateway_runtime`` key (written by the gateway's
-        ``_sync_session_model_from_agent`` and the CLI ``/model`` persist),
-        falling back to the top-level ``provider``/``base_url``/``api_mode``
-        keys the TUI gateway's ``_runtime_model_config`` writes. As a last
-        resort, falls back to the ``billing_provider`` column (written on
-        every session's first accounted API call) so sessions that never ran
-        ``/model`` still restore the provider that actually served them.
-        Returns an empty dict on any parse failure — resume falls back to
-        ambient config resolution.
+        JSON string) or an already-parsed dict. Callers read the model from
+        the ``sessions.model`` column themselves, so the provider returned
+        here has to belong to THAT model. Two axes can disagree:
+
+        * the config axis — ``model_config["model"]``/``["provider"]``
+          (written together by the TUI's ``_runtime_model_config``) and the
+          nested ``gateway_runtime`` (written together with the
+          ``sessions.model`` column by ``_sync_session_model_from_agent``;
+          ``gateway_runtime`` never carries its own ``model`` key),
+        * the billing axis — ``billing_provider``/``billing_base_url``
+          (``update_session_billing_route`` rewrites them on a mid-session
+          model switch WITHOUT the model, so only this axis can go stale
+          half-way; ``update_token_counts`` writes model + billing together
+          on the first accounted call).
+
+        Resolution order:
+
+        1. If ``model_config["model"]`` is non-empty and differs from
+           ``sessions.model``, the config axis is stale relative to the
+           model that last served; a complete billing axis (provider set,
+           not bare, base_url set) wins outright.
+        2. Otherwise the config axis belongs to ``sessions.model``:
+           nested ``gateway_runtime`` with a provider first, then the
+           top-level ``provider``/``base_url``/``api_mode`` keys.
+        3. If the chosen config axis carries no provider but a usable
+           (set, non-bare) ``billing_provider`` exists, the provider is
+           supplemented from the billing axis while base_url/api_mode stay
+           on the config axis.
+        4. If no config axis contributes anything, fall back to
+           ``{"provider": billing_provider}`` alone (set, non-bare).
+
+        On a parse failure the config axis is empty, so the result is the
+        billing fallback of rule 4 — an empty dict only when no usable
+        ``billing_provider`` exists either. Never includes a ``model`` key:
+        callers own the model via ``sessions.model``.
         """
-        raw = (session_meta or {}).get("model_config")
+        meta = session_meta or {}
+        raw = meta.get("model_config")
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -8992,34 +9018,86 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raw = {}
         if not isinstance(raw, dict):
             raw = {}
+
+        session_model = str(meta.get("model") or "").strip()
+        config_model = str(raw.get("model") or "").strip()
+        billing_provider = str(meta.get("billing_provider") or "").strip()
+        billing_base_url = str(meta.get("billing_base_url") or "").strip()
+        billing_usable = bool(
+            billing_provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS
+        )
+        # Complete = routable identity AND endpoint. Without base_url the
+        # billing axis must not replace the config axis wholesale (rule 1);
+        # the bare provider alone still qualifies as a supplement (rule 3)
+        # and as the last-resort identity (rule 4).
+        billing_complete = billing_usable and bool(billing_base_url)
+
+        # Rule 1: a non-empty config model that differs from sessions.model
+        # means the top-level config was written for a different model than
+        # the one that last served (measured rows D/E). An empty
+        # sessions.model carries no information to be stale against, so it
+        # never counts as a conflict.
         runtime = raw.get("gateway_runtime")
-        if isinstance(runtime, dict) and runtime.get("provider"):
-            # Filter None values: the persist path writes or-None to trigger
-            # deletion in the top-level merge, but gateway_runtime is replaced
-            # as a whole dict (not deep-merged), so None values survive here.
+        nested_has_provider = isinstance(runtime, dict) and bool(runtime.get("provider"))
+
+        # Rule 1 must not outrank a nested gateway_runtime.
+        # ``_sync_session_model_from_agent`` writes gateway_runtime and the
+        # sessions.model column in ONE call and never touches the top-level
+        # ``model`` key, so after a provider fallback the top-level key is
+        # stale BY CONSTRUCTION while gateway_runtime is the fresh half. The
+        # billing axis is frozen at that moment: try_activate_fallback does
+        # not call update_session_billing_route, and update_token_counts
+        # pins billing_provider via COALESCE. Letting a stale top-level model
+        # hand the route to that frozen billing axis reproduces the exact 404
+        # loop this function exists to prevent (adversarial review 2026-08-22,
+        # confirmed by two independent reviewers against a replayed writer
+        # chain). gateway_runtime can never go stale against sessions.model,
+        # so it wins outright.
+        # Filter None values: the persist path writes or-None to trigger
+        # deletion in the top-level merge, but gateway_runtime is replaced
+        # as a whole dict (not deep-merged), so None values survive here.
+        if nested_has_provider:
             return {k: v for k, v in runtime.items() if v is not None}
+
+        if config_model and session_model and config_model != session_model:
+            if billing_complete:
+                return {"provider": billing_provider, "base_url": billing_base_url}
+            # Billing incomplete: keep the legacy config-axis order below
+            # rather than guessing.
+
+        # Rule 2: legacy precedence inside the config axis.
+
         top_level = {
             key: raw.get(key)
             for key in ("provider", "base_url", "api_mode")
             if raw.get(key)
         }
-        if top_level:
-            return top_level
-        # Last resort: billing_provider column. Written via COALESCE on every
-        # session's first accounted API call — the only durable record for
-        # sessions that never ran /model. Mirrors the TUI gateway's
-        # _stored_session_runtime_overrides fallback. Bare billing buckets
+        chosen = top_level
+        if not chosen and isinstance(runtime, dict):
+            # gateway_runtime without a provider still documents the route
+            # shape; keep its non-None entries instead of dropping them.
+            chosen = {k: v for k, v in runtime.items() if v is not None}
+
+        if chosen:
+            # Presence is not enough: the gateway_runtime passthrough above
+            # keeps empty strings (it only filters None), so a stored
+            # ``provider: ""`` would block the billing supplement and then be
+            # returned as the provider. Test the VALUE.
+            if not str(chosen.get("provider") or "").strip() and billing_usable:
+                # Rule 3: the config axis describes base_url/api_mode but
+                # lost its provider; the billing provider is the only
+                # durable identity left. Keeps sessions that never ran
+                # /model on the provider that actually served them.
+                chosen = dict(chosen)
+                chosen["provider"] = billing_provider
+            return chosen
+
+        # Rule 4: nothing on the config axis. Bare billing buckets
         # ("auto"/"custom") are not routable identities — filter them out so
         # resume falls back to the ambient config default instead.
-        billing_provider = str(
-            (session_meta or {}).get("billing_provider") or ""
-        ).strip()
-        if (
-            billing_provider
-            and billing_provider.lower() not in _BARE_BILLING_PROVIDERS
-        ):
+        if billing_usable:
             return {"provider": billing_provider}
-        return {k: v for k, v in (runtime or {}).items() if v is not None} if isinstance(runtime, dict) else {}
+        return {}
 
     def update_session_billing_route(
         self,

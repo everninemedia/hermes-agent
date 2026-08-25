@@ -527,22 +527,26 @@ class SessionManager:
         if row.get("source") != "acp":
             return None
 
-        # Extract cwd from model_config.
+        # Extract cwd from model_config. provider + base_url + api_mode are
+        # ONE axis with ``sessions.model`` below, so they come from the single
+        # reader that picks the axis that model belongs to. Overlaying
+        # model_config.provider on billing_base_url independently (the previous
+        # shape here) paired a Codex model with the xAI endpoint after a
+        # fallback and produced the 404 loop of 2026-08-20.
         cwd = "."
-        requested_provider = row.get("billing_provider")
-        restored_base_url = row.get("billing_base_url")
-        restored_api_mode = None
         mc = row.get("model_config")
         if mc:
             try:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
                     cwd = meta.get("cwd", ".")
-                    requested_provider = meta.get("provider") or requested_provider
-                    restored_base_url = meta.get("base_url") or restored_base_url
-                    restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
                 pass
+        from hermes_state import SessionDB as _SessionDB
+        _runtime = _SessionDB.session_gateway_runtime(row)
+        requested_provider = _runtime.get("provider") or None
+        restored_base_url = _runtime.get("base_url") or None
+        restored_api_mode = _runtime.get("api_mode") or None
 
         model = row.get("model") or None
 

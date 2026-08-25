@@ -5353,7 +5353,7 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 # ``billing_provider="openrouter"``; dropping it forces resume to the current
 # global model (e.g. a custom endpoint), which is the wrong provider for the
 # stored model. See #57588.
-from hermes_state import _BARE_BILLING_PROVIDERS
+from hermes_state import SessionDB as _SessionDBForRuntime
 
 
 def _overrides_have_routable_provider(overrides: dict) -> bool:
@@ -5474,20 +5474,22 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
     overrides: dict = {}
     model = str(row.get("model") or model_config.get("model") or "").strip()
-    # ``billing_provider`` is only the billing bucket — for a custom endpoint it is the
-    # bare class ``"custom"``, which agent_init treats as non-routable, so restoring it as
-    # the provider override makes ``session.resume`` fail with "No LLM provider configured".
-    # Only restore an explicit provider; otherwise leave it unset so resume falls back to
-    # the configured default, matching the working CLI path.
-    explicit_provider = str(model_config.get("provider") or "").strip()
-    billing_provider = str(
-        model_config.get("billing_provider") or row.get("billing_provider") or ""
-    ).strip()
-    provider = explicit_provider
-    if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
-        provider = billing_provider
-    base_url = str(model_config.get("base_url") or "").strip()
-    api_mode = str(model_config.get("api_mode") or "").strip()
+    # provider + base_url + api_mode are ONE axis with ``sessions.model``, and
+    # ``SessionDB.session_gateway_runtime`` is the single reader that picks the
+    # axis that model belongs to. Reading the provider here independently —
+    # model_config.provider first, billing_provider as fallback — ignored the
+    # nested ``gateway_runtime`` entirely and paired a Codex model with the xAI
+    # endpoint after a fallback: HTTP 404, fallback, restore, 404 again, six
+    # times in an hour on 2026-08-20. Measured on the live profile databases,
+    # this path returned the wrong provider for 3 session rows while the CLI
+    # path returned the right one for the same rows.
+    # The reader still filters bare billing buckets ("auto"/"custom"), which
+    # agent_init treats as non-routable, so the "No LLM provider configured"
+    # regression this block used to guard against stays guarded.
+    _runtime = _SessionDBForRuntime.session_gateway_runtime(row)
+    provider = str(_runtime.get("provider") or "").strip()
+    base_url = str(_runtime.get("base_url") or "").strip()
+    api_mode = str(_runtime.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
 

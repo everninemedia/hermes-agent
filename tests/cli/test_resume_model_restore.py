@@ -365,3 +365,220 @@ def test_restore_session_model_restores_billing_provider_fallback():
     })
     assert stub.model == "glm-4.7"
     assert stub.provider == "minimax"
+
+
+# ── Resume axis: provider must belong to sessions.model (2026-08-22) ──
+# Regression guard for the 404 loop: session_gateway_runtime returns only the
+# provider/base_url/api_mode, while all three resume paths read the model from
+# the ``sessions.model`` column themselves. When the two axes disagree, a model
+# of provider B was requested at provider A.
+#
+# These fixtures are NOT invented. Each one is the verbatim routing part of a
+# real row measured on 2026-08-22 in ~/.hermes/profiles/{content,evm}/state.db,
+# and each expectation is the value the reader actually returns for that row.
+# An earlier attempt shipped 883 green tests built on simplified fixtures and
+# still made the live bestand worse — a green test over a stand-in proves the
+# stand-in.
+
+_LUNA = "gpt-5.6-luna"
+_CODEX_URL = "https://chatgpt.com/backend-api/codex/"
+_XAI_URL = "https://api.x.ai/v1"
+
+
+def test_session_gateway_runtime_row_a_config_axis_owns_the_session_model():
+    """content/20260811_130350: config axis carries the same model as the column.
+
+    billing_provider says xai-oauth for a Codex model — that half-written axis
+    is the stale one (update_session_billing_route rewrites billing_* without
+    the model). The config axis wins and keeps Luna on Codex.
+    """
+    meta = {
+        "model": _LUNA,
+        "billing_provider": "xai-oauth",
+        "billing_base_url": _XAI_URL,
+        "billing_mode": "subscription_included",
+        "model_config": json.dumps({
+            "model": _LUNA,
+            "provider": "openai-codex",
+            "base_url": _CODEX_URL,
+            "api_mode": "codex_responses",
+        }),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime == {
+        "provider": "openai-codex",
+        "base_url": _CODEX_URL,
+        "api_mode": "codex_responses",
+    }
+
+
+def test_session_gateway_runtime_row_c_nested_axis_owns_the_session_model():
+    """content/20260820_165215: only gateway_runtime, no top-level model.
+
+    ``_sync_session_model_from_agent`` writes gateway_runtime together with the
+    ``sessions.model`` column, so the nested axis owns that model even though it
+    carries no model key of its own (verified: 7 rows carry gateway_runtime,
+    0 of them a model key). ``fallback_active`` rides along and is harmless —
+    the three callers read provider/base_url/api_mode only.
+    """
+    meta = {
+        "model": _LUNA,
+        "billing_provider": "xai-oauth",
+        "billing_base_url": _XAI_URL,
+        "model_config": json.dumps({
+            "gateway_runtime": {
+                "provider": "openai-codex",
+                "base_url": _CODEX_URL,
+                "api_mode": "codex_responses",
+                "fallback_active": True,
+            }
+        }),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime["provider"] == "openai-codex"
+    assert runtime["base_url"] == _CODEX_URL
+    assert runtime["api_mode"] == "codex_responses"
+
+
+def test_session_gateway_runtime_row_d_stale_config_yields_to_complete_billing():
+    """evm/20260820_155519 and content/20260820_184950: the reported 404 loop.
+
+    model_config still holds the launch-time primary (grok-4.6 on xai-oauth)
+    while the column moved to the fallback that actually served. A config model
+    that differs from the column marks the config axis as stale, so the complete
+    billing pair wins and Luna goes back to Codex.
+    """
+    meta = {
+        "model": _LUNA,
+        "billing_provider": "openai-codex",
+        "billing_base_url": _CODEX_URL,
+        "billing_mode": "subscription_included",
+        "model_config": json.dumps({"model": "grok-4.6", "provider": "xai-oauth"}),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime == {"provider": "openai-codex", "base_url": _CODEX_URL}
+
+
+def test_session_gateway_runtime_never_leaks_billing_mode_as_api_mode():
+    """billing_mode is not api_mode — a withdrawn patch conflated the two.
+
+    billing_mode takes subscription_included / official_models_api / api_key;
+    api_mode takes anthropic_messages / chat_completions / codex_responses /
+    bedrock_converse. Feeding the billing bucket into api_mode hands the agent
+    a protocol name that no client knows.
+    """
+    meta = {
+        "model": _LUNA,
+        "billing_provider": "openai-codex",
+        "billing_base_url": _CODEX_URL,
+        "billing_mode": "subscription_included",
+        "model_config": json.dumps({"model": "grok-4.6", "provider": "xai-oauth"}),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime.get("api_mode") != "subscription_included"
+    assert "model" not in runtime
+
+
+def test_session_gateway_runtime_supplements_provider_from_billing_without_base_url():
+    """The trap shape: billing_provider without billing_base_url.
+
+    The config axis describes base_url/api_mode but lost its provider. The
+    billing axis is incomplete, so it must not win outright — it may only
+    supplement the missing provider. Getting this wrong is what turned
+    test_session_resume_passes_stored_runtime_to_agent red in an earlier round.
+    """
+    meta = {
+        "model": _LUNA,
+        "billing_provider": "openai-codex",
+        "model_config": json.dumps({
+            "base_url": _CODEX_URL,
+            "api_mode": "codex_responses",
+        }),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime == {
+        "provider": "openai-codex",
+        "base_url": _CODEX_URL,
+        "api_mode": "codex_responses",
+    }
+
+
+def test_session_gateway_runtime_empty_session_model_is_not_a_conflict():
+    """No column model means nothing to be stale against — config axis stands."""
+    meta = {
+        "model": "",
+        "billing_provider": "openai-codex",
+        "billing_base_url": _CODEX_URL,
+        "model_config": json.dumps({"model": "grok-4.6", "provider": "xai-oauth"}),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime["provider"] == "xai-oauth"
+
+
+def test_session_gateway_runtime_nested_axis_outranks_a_stale_top_level_model():
+    """After a provider fallback the top-level model key is stale BY DESIGN.
+
+    ``_sync_session_model_from_agent`` writes gateway_runtime together with the
+    sessions.model column and never touches ``model_config["model"]``, so a
+    fallback leaves the top-level key on the launch-time model while
+    gateway_runtime holds the provider that actually served. The billing axis is
+    frozen at the same moment: try_activate_fallback does not call
+    update_session_billing_route, and update_token_counts pins billing_provider
+    via COALESCE.
+
+    Handing the route to that frozen billing axis because the stale top-level
+    model differs would request a Codex model at the xAI endpoint — the very 404
+    loop this reader exists to prevent. Found by adversarial review on
+    2026-08-22 and confirmed against a replayed writer chain; both profiles ship
+    fallback_providers with a cross-provider entry, so the shape is one
+    rate-limit away.
+    """
+    meta = {
+        "model": _LUNA,
+        "billing_provider": "xai-oauth",
+        "billing_base_url": _XAI_URL,
+        "model_config": json.dumps({
+            "model": "grok-4.6",
+            "provider": "xai-oauth",
+            "gateway_runtime": {
+                "provider": "openai-codex",
+                "base_url": _CODEX_URL,
+                "api_mode": "codex_responses",
+                "fallback_active": True,
+            },
+        }),
+    }
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime["provider"] == "openai-codex"
+    assert runtime["base_url"] == _CODEX_URL
+    assert runtime["api_mode"] == "codex_responses"
+
+
+def test_stored_session_runtime_overrides_uses_the_shared_axis_reader():
+    """The TUI gateway resume must not resolve the provider on its own.
+
+    Until 2026-08-22 ``_stored_session_runtime_overrides`` read
+    model_config.provider with billing_provider as a fallback and ignored the
+    nested gateway_runtime entirely. Measured against the live profile
+    databases, that path returned the wrong provider for 3 session rows while
+    the CLI path returned the right one for the same rows — and the gateway is
+    where the 404 loop actually ran.
+    """
+    from tui_gateway.server import _stored_session_runtime_overrides
+
+    row = {
+        "model": _LUNA,
+        "billing_provider": "xai-oauth",
+        "billing_base_url": _XAI_URL,
+        "model_config": json.dumps({
+            "gateway_runtime": {
+                "provider": "openai-codex",
+                "base_url": _CODEX_URL,
+                "api_mode": "codex_responses",
+            }
+        }),
+    }
+    overrides = _stored_session_runtime_overrides(row)
+    assert overrides["provider_override"] == "openai-codex"
+    assert overrides["model_override"]["model"] == _LUNA
+    assert overrides["model_override"]["base_url"] == _CODEX_URL
