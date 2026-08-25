@@ -53,6 +53,7 @@ export type BudgetMeasureServiceDeps = {
   logger?: (message: string) => void
   now?: () => Date
   challengeGraceMs?: number
+  chmodSocket?: (path: string, mode: number) => void
 }
 
 export type BudgetMeasureProviderResult = {
@@ -351,6 +352,7 @@ export class BudgetMeasureService {
   private closedHandler: Listener | null = null
   private rendererGoneHandler: Listener | null = null
   private busy = false
+  private measureEpoch = 0
   private currentRunStarted: string | null = null
   private activeAbort: AbortController | null = null
 
@@ -402,11 +404,18 @@ export class BudgetMeasureService {
       server.once('error', onError)
       server.listen(this.socketPath, () => {
         server.off('error', onError)
+        const chmodSocket = this.deps.chmodSocket || chmodSync
 
         try {
-          chmodSync(this.socketPath, SOCKET_MODE)
+          chmodSocket(this.socketPath, SOCKET_MODE)
         } catch (error) {
-          this.deps.logger?.(`[budget] Socket-Rechte konnten nicht gesetzt werden: ${String(error)}`)
+          server.close()
+          this.server = null
+          removeIfPresent(this.socketPath)
+          removeIfPresent(this.tokenPath)
+          reject(error)
+
+          return
         }
 
         resolve()
@@ -552,6 +561,7 @@ export class BudgetMeasureService {
     }
 
     this.results.set(runId, { run, expiresAt: Date.now() + RESULT_TTL_MS })
+    this.measureEpoch += 1
     this.busy = true
     this.currentRunStarted = run.started_at
     this.activeAbort = new AbortController()
@@ -584,7 +594,7 @@ export class BudgetMeasureService {
       return
     }
 
-    json(res, 200, { found: true, status: 'complete', result: entry.run })
+    json(res, 200, entry.run)
   }
 
   private async runMeasurement(run: BudgetMeasureRun, providers: ProviderId[], signal: AbortSignal) {
@@ -616,10 +626,11 @@ export class BudgetMeasureService {
       const entry = this.results.get(run.run_id)
 
       if (entry) {entry.expiresAt = Date.now() + RESULT_TTL_MS}
-      await this.parkMeasurementWindow()
+      const epoch = this.measureEpoch
       this.busy = false
       this.currentRunStarted = null
       this.activeAbort = null
+      await this.parkMeasurementWindow(epoch)
     }
   }
 
@@ -627,16 +638,22 @@ export class BudgetMeasureService {
     return { status, observed_at: null, detail: redactBudgetOutput(detail).slice(0, 400) }
   }
 
-  private async parkMeasurementWindow() {
+  private async parkMeasurementWindow(epoch: number) {
     const window = this.measurementWindow
+
+    if (this.measureEpoch !== epoch || this.busy) {return}
 
     if (!window || window.isDestroyed()) {return}
 
     try {
       await timeout(window.loadURL('about:blank', { timeout: 5000 }), 5000, 'park_timeout')
     } catch {
-      this.destroyMeasurementWindow()
+      if (this.measureEpoch === epoch && !this.busy) {this.destroyMeasurementWindow()}
+
+      return
     }
+
+    if (this.measureEpoch !== epoch || this.busy) {return}
   }
 
   private async ensureMeasurementWindow(): Promise<WindowLike> {
@@ -717,6 +734,8 @@ export class BudgetMeasureService {
     try {
       if (this.navigationHandler) {window.webContents.removeListener?.('will-navigate', this.navigationHandler)}
 
+      if (this.rendererGoneHandler) {window.webContents.removeListener?.('render-process-gone', this.rendererGoneHandler)}
+
       if (this.closedHandler) {window.removeListener?.('closed', this.closedHandler)}
 
       if (this.measurementSession && this.downloadHandler) {this.measurementSession.off?.('will-download', this.downloadHandler)}
@@ -727,6 +746,7 @@ export class BudgetMeasureService {
     this.measurementWindow = null
     this.measurementSession = null
     this.navigationHandler = null
+    this.rendererGoneHandler = null
     this.downloadHandler = null
     this.closedHandler = null
     this.openWindowHandler = null

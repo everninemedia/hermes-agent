@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -19,20 +19,25 @@ class FakeSession extends EventEmitter {
 class FakeWindow extends EventEmitter {
   static delayMs = 0
   static missingEvidence = false
+  static last: FakeWindow | null = null
   currentUrl = 'about:blank'
   destroyed = false
   session: FakeSession
   webContents: any
+  removedEvents: string[] = []
 
   constructor(options: any) {
     super()
+    FakeWindow.last = this
     this.session = options.webPreferences.session
     this.webContents = {
       session: this.session,
       setAudioMuted: () => {},
       setWindowOpenHandler: () => {},
       on: () => {},
-      removeListener: () => {},
+      removeListener: (event: string) => {
+        this.removedEvents.push(event)
+      },
       stop: () => {},
       executeJavaScript: async (code: string) => {
         if (code.includes('url: location.href')) {
@@ -105,6 +110,21 @@ function rpc(socketPath: string, token: string, method: string, path: string, bo
   })
 }
 
+async function waitForComplete(socketPath: string, token: string, runId: string) {
+  for (let i = 0; i < 40; i += 1) {
+    const polled = await rpc(socketPath, token, 'GET', `/result?run_id=${encodeURIComponent(runId)}`)
+    const payload = polled.body?.result && polled.body.result.providers ? polled.body.result : polled.body
+
+    if (polled.status === 200 && payload?.status === 'complete' && payload.providers) {
+      return payload
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+
+  throw new Error(`kein complete fuer ${runId}`)
+}
+
 test('redactBudgetOutput removes credential-shaped output before transport', () => {
   const value = redactBudgetOutput('mail t@example.com ?token=abc Bearer abc /magic/one eyJabc.def.ghi')
   assert.equal(value.includes('t@example.com'), false)
@@ -144,20 +164,7 @@ test('D1 RPC authenticates, enforces one run, and returns normalized provider re
     const busy = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai'] })
     assert.equal(busy.status, 409)
     assert.equal(busy.body.reason, 'busy')
-    const runId = accepted.body.run_id
-    let result: any = null
-
-    for (let i = 0; i < 20; i += 1) {
-      const polled = await rpc(socketPath, token, 'GET', `/result?run_id=${encodeURIComponent(runId)}`)
-
-      if (polled.body.status === 'complete') {
-        result = polled.body.result
-
-        break
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
+    const result = await waitForComplete(socketPath, token, accepted.body.run_id)
 
     assert.equal(result.status, 'complete')
     assert.equal(result.providers.zai.status, 'ok')
@@ -167,21 +174,13 @@ test('D1 RPC authenticates, enforces one run, and returns normalized provider re
     assert.equal(result.providers.codex.status, 'ok')
     assert.equal(result.providers.zai.quote.includes('21'), true)
 
+    const healthAfterComplete = await rpc(socketPath, token, 'GET', '/health')
+    assert.equal(healthAfterComplete.body.busy, false)
+
     FakeWindow.missingEvidence = true
     const missingEvidenceRun = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai'] })
     assert.equal(missingEvidenceRun.status, 202)
-    let missingEvidenceResult: any = null
-
-    for (let i = 0; i < 20; i += 1) {
-      const polled = await rpc(socketPath, token, 'GET', `/result?run_id=${encodeURIComponent(missingEvidenceRun.body.run_id)}`)
-
-      if (polled.body.status === 'complete') {
-        missingEvidenceResult = polled.body.result
-        break
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
+    const missingEvidenceResult = await waitForComplete(socketPath, token, missingEvidenceRun.body.run_id)
 
     assert.equal(missingEvidenceResult.providers.zai.status, 'structure_unknown')
   } finally {
@@ -189,6 +188,120 @@ test('D1 RPC authenticates, enforces one run, and returns normalized provider re
     FakeWindow.missingEvidence = false
     await service.stop()
     assert.equal(existsSync(join(root, 'budget-measure.token')), false)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('busy is released before park so the next measure is accepted', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-park-'))
+  const session = new FakeSession()
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    fromPartition: () => session,
+    now: () => new Date('2026-08-25T08:08:00.000Z')
+  })
+
+  try {
+    await service.start()
+    const { socketPath, tokenPath } = service.getPaths()
+    const token = readFileSync(tokenPath, 'utf8').trim()
+    FakeWindow.delayMs = 40
+    const first = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai'] })
+    const firstResult = await waitForComplete(socketPath, token, first.body.run_id)
+    assert.equal(firstResult.status, 'complete')
+    const second = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai'] })
+    assert.equal(second.status, 202)
+    assert.equal(second.body.accepted, true)
+    await waitForComplete(socketPath, token, second.body.run_id)
+
+    for (let i = 0; i < 20; i += 1) {
+      if (FakeWindow.last?.currentUrl === 'about:blank') {break}
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    assert.equal(FakeWindow.last?.currentUrl, 'about:blank')
+  } finally {
+    FakeWindow.delayMs = 0
+    await service.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('stale socket without a live server is replaced and a live socket is a start error', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-stale-'))
+  const session = new FakeSession()
+  writeFileSync(join(root, 'budget-measure.sock'), 'stale')
+
+  const first = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    fromPartition: () => session,
+    now: () => new Date('2026-08-25T08:08:00.000Z')
+  })
+
+  const second = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    fromPartition: () => session,
+    now: () => new Date('2026-08-25T08:08:00.000Z')
+  })
+
+  try {
+    await first.start()
+    await assert.rejects(() => second.start(), /budget_measure_socket_in_use/)
+  } finally {
+    await first.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('renderer crash handler is removed on teardown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-teardown-'))
+  const session = new FakeSession()
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    fromPartition: () => session,
+    now: () => new Date('2026-08-25T08:08:00.000Z')
+  })
+
+  try {
+    await service.start()
+    const { socketPath, tokenPath } = service.getPaths()
+    const token = readFileSync(tokenPath, 'utf8').trim()
+    const accepted = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai'] })
+    await waitForComplete(socketPath, token, accepted.body.run_id)
+    const window = FakeWindow.last
+    await service.stop()
+    assert.equal(window?.removedEvents.includes('render-process-gone'), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('socket chmod failure is fail-closed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-chmod-'))
+  const session = new FakeSession()
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    fromPartition: () => session,
+    now: () => new Date('2026-08-25T08:08:00.000Z'),
+    chmodSocket: () => {
+      throw new Error('chmod_denied')
+    }
+  })
+
+  try {
+    await assert.rejects(() => service.start(), /chmod_denied/)
+    assert.equal(existsSync(join(root, 'budget-measure.sock')), false)
+    assert.equal(existsSync(join(root, 'budget-measure.token')), false)
+  } finally {
+    await service.stop()
     await rm(root, { recursive: true, force: true })
   }
 })
