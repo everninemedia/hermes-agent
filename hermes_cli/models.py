@@ -506,7 +506,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # discovery floor — live entries lead in the picker and stale curated
     # names never pollute the top.
     "opencode-zen": [
-        "x-preview-f-free",  # "Ox Alpha" stealth model — free, 1M ctx, ZDR
         "kimi-k3",
         "kimi-k2.5",
         "kimi-k2.6",
@@ -624,9 +623,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "hy3",
         "hy3-preview",
         "muse-spark-1.2-contributor",
-        # Go-subscription twin of the Zen keyless Ox Alpha (live go/v1
-        # catalog 2026-08-21; NOT keyless — Go relay requires a Go key).
-        "ox-alpha-free",
     ],
     "kilocode": [
         "anthropic/claude-opus-4.6",
