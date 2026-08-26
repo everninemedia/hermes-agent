@@ -121,6 +121,10 @@
           "description": ""
         },
         {
+          "id": "z-ai/glm-5.3-flash",
+          "description": "GLM-5.3-Flash"
+        },
+        {
           "id": "z-ai/glm-5.3",
           "description": ""
         },
@@ -283,6 +287,9 @@
         },
         {
           "id": "minimax/minimax-m3"
+        },
+        {
+          "id": "z-ai/glm-5.3-flash"
         },
         {
           "id": "z-ai/glm-5.3"

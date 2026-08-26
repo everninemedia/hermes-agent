@@ -117,6 +117,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # MiniMax
     ("minimax/minimax-m3",                     ""),
     # Z-AI
+    ("z-ai/glm-5.3-flash",                    "GLM-5.3-Flash"),
     ("z-ai/glm-5.3",                           ""),
     ("z-ai/glm-5.3-flash",                     ""),
     ("z-ai/glm-5.2",                           "default"),
@@ -299,6 +300,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # MiniMax
         "minimax/minimax-m3",
         # Z-AI
+        "z-ai/glm-5.3-flash",
         "z-ai/glm-5.3",
         "z-ai/glm-5.3-flash",
         "z-ai/glm-5.2",
@@ -375,6 +377,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-flash-lite-preview",
     ],
     "zai": [
+        "glm-5.3-flash",
         "glm-5.3",
         "glm-5.3-flash",
         "glm-5.2",
@@ -601,6 +604,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2.5",
         "gpt-5.6-luna",
         "grok-4.5",
+        "glm-5.3-flash",
         "glm-5.3",
         "glm-5.3-flash",
         "glm-5.2",
@@ -5545,13 +5549,11 @@ def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[s
     return current
 
 
-# OpenCode Zen free-tier models (``*-free`` slugs, e.g. x-preview-f-free /
-# "Ox Alpha", plus unsuffixed free models like big-pickle) are served
-# ANONYMOUSLY on the Zen relay: a request with no Authorization header
-# succeeds, while ANY non-empty bearer the relay doesn't recognize is
-# rejected with 401 "Invalid API key" — including our "no-key-required"
-# placeholder and OpenCode GO subscription keys (the Go relay doesn't serve
-# the free tier at all: "Model x is not supported").
+# OpenCode Zen free-tier models (``*-free`` slugs plus unsuffixed free
+# models like big-pickle) are served ANONYMOUSLY on the Zen relay: a request
+# with no Authorization header succeeds, while ANY non-empty bearer the relay
+# doesn't recognize is rejected with 401 "Invalid API key". The Go relay does
+# not serve the free tier ("Model x is not supported").
 # Verified live 2026-08-21 against POST /zen/v1/chat/completions.
 OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER = "opencode-zen-free-keyless"
 _OPENCODE_ZEN_FREE_BASE_URL = "https://opencode.ai/zen/v1"
@@ -5580,7 +5582,7 @@ def is_opencode_zen_free_model(model_id: Optional[str]) -> bool:
 
     Matches the ``*-free`` suffix plus the known unsuffixed free slugs
     (``big-pickle``). Tolerates provider-prefixed ids
-    (``opencode-zen/x-preview-f-free``). The Go catalog serves no free
+    (``opencode-zen/<free-slug>``). The Go catalog serves no free
     models (verified 2026-08-21), so this identifies the Zen free tier
     across the OpenCode family.
     """
