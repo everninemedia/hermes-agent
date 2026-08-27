@@ -1138,7 +1138,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         if action == "repair":
             return _cmd_repair(args)
         try:
-            kb.init_db()
+            if action in _READONLY_KANBAN_ACTIONS:
+                # Open existing board without the mutation-y init_db backfill.
+                with kb.connect_closing():
+                    pass
+            else:
+                kb.init_db()
         except Exception as exc:
             print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
             return 1
@@ -1261,6 +1266,34 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "set-default-workdir",
 })
 
+# Read-only CLI actions. list/show/stats must not run init_db's write_txn
+# backfill; that is what blocked `hermes kanban list` in delegate_task
+# child contexts (Reibungslog 260826). Marker: _child_readonly_kanban_list
+_READONLY_KANBAN_ACTIONS: frozenset[str] = frozenset({
+    "list",
+    "ls",
+    "show",
+    "diagnostics",
+    "diag",
+    "stats",
+    "log",
+    "runs",
+    "assignees",
+    "attachments",
+    "notify-list",
+    "context",
+    "tail",
+})
+
+
+def _in_delegated_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
 
 def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
     action = getattr(args, "kanban_action", None)
@@ -1270,12 +1303,7 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
             return False
     elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
         return False
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
-
-        return is_delegated_child_process_context()
-    except Exception:
-        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+    return _in_delegated_child_context()
 
 
 # ---------------------------------------------------------------------------
@@ -1745,7 +1773,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # recompute_ready opens write_txn; skip it in delegated child
+        # contexts so a read stays a read (_child_readonly_kanban_list).
+        if not _in_delegated_child_context():
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,

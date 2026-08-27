@@ -58,3 +58,54 @@ def test_delegated_child_kanban_cli_refusal_returns_nonzero_exit_status(tmp_path
 
     assert refused.returncode == 1
     assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
+
+
+def test_delegated_child_kanban_list_is_allowed(tmp_path):
+    """list is read-only; child contexts must still be able to inspect cards."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    created = _run_hermes(home, "kanban", "create", "list probe", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+
+    listed = _run_hermes(home, "kanban", "list", "--json", marker=True)
+    assert listed.returncode == 0, listed.stderr
+    payload = json.loads(listed.stdout)
+    ids = {row.get("id") for row in payload}
+    assert task_id in ids
+
+
+def test_delegated_child_kanban_list_with_board_flag_is_allowed(tmp_path):
+    """The session-end form: hermes kanban --board <slug> list --json."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    created = _run_hermes(home, "kanban", "create", "board list probe", "--json")
+    assert created.returncode == 0, created.stderr
+
+    listed = _run_hermes(
+        home, "kanban", "--board", "default", "list", "--json", marker=True
+    )
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout)
+
+
+def test_delegated_child_kanban_complete_still_refused(tmp_path):
+    """Gegenprobe: a real mutation from a child context stays blocked."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    created = _run_hermes(home, "kanban", "create", "complete probe", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+
+    refused = _run_hermes(
+        home,
+        "kanban",
+        "complete",
+        task_id,
+        marker=True,
+    )
+    assert refused.returncode == 1
+    assert "delegate_task child contexts cannot mutate Kanban tasks via the CLI" in refused.stderr
