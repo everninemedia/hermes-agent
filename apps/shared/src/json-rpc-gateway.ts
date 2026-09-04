@@ -384,8 +384,9 @@ export class JsonRpcGatewayClient {
           if (this.pending.delete(id)) {
             detach()
             // Include the configured timeout so a caller (or a user looking
-            // at an error toast) can tell whether the default 30s window
-            // fired or a per-call override — e.g. /compress opts into 120s.
+            // at an error toast) can tell whether the default window fired
+            // or a per-call override — e.g. /compress opts into the 600s
+            // compressor ceiling, not the default RPC budget.
             const seconds = Math.round(timeoutMs / 1000)
             reject(new Error(`request timed out after ${seconds}s: ${method}`))
           }

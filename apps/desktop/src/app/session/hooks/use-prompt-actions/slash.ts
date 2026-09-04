@@ -73,10 +73,12 @@ import {
   withSessionNotFoundResume
 } from './utils'
 
-// Manual compression is LLM-bound and routinely outlives the desktop's 30s
-// default WS request timeout on large sessions — give it the TUI client's
-// 120s RPC budget (HERMES_TUI_RPC_TIMEOUT_MS default) instead.
-const SESSION_COMPRESS_TIMEOUT_MS = 120_000
+// Manual compression is LLM-bound. The compressor wait ceiling is 600s
+// (DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS). A shorter client timeout rejects
+// the RPC while the worker is still running, then toasts a fake failure
+// (`request timed out after 120s: session.compress`) even though the commit
+// lands. Keep the UI on the same ceiling as the worker.
+const SESSION_COMPRESS_TIMEOUT_MS = 600_000
 const WAKE_START_TIMEOUT_MS = 180_000
 
 const wakeDeviceLabel = (device?: WakeInputDeviceStatus): string => {
