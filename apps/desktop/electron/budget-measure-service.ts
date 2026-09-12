@@ -125,7 +125,7 @@ const PROVIDER_CONFIG: Record<ProviderId, { url: string; warmup: string; marker:
   claude: {
     url: 'https://claude.ai/new#settings/usage',
     warmup: 'https://claude.ai/new',
-    marker: /(?:all\s+models|alle\s+modelle)/i
+    marker: /(?:all\s+models|alle\s+modelle|diese\s+woche|this\s+week|w(?:ö|oe)chentlichen\s+limits|weekly\s+limit)/i,
   },
   codex: {
     url: 'https://chatgpt.com/codex/cloud/settings/analytics#usage',
@@ -666,7 +666,9 @@ export class BudgetMeasureService {
       /w(?:ö|oe)chentliches nutzungslimit[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}verbleibend/i,
       /supergrok[\s\S]{0,60}?limit[\s\S]{0,40}(?:gebraucht|used)/i,
       /w(?:ö|oe)chentliche quote[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}gebraucht/i,
-      /all models?[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}used/i
+      /all models?[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}used/i,
+      /alle modelle[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}verwendet/i,
+      /(?:diese woche|this week)[\s\S]{0,80}\d{1,3}\s*%[\s\S]{0,40}(?:verwendet|used)/i
     ]
 
     return patterns.some(pattern => pattern.test(value))

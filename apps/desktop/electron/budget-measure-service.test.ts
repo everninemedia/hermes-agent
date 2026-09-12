@@ -20,6 +20,7 @@ class FakeWindow extends EventEmitter {
   static delayMs = 0
   static missingEvidence = false
   static ignoreStaticClaudeHash = false
+  static claudeUsageText = ''
   static last: FakeWindow | null = null
   currentUrl = 'about:blank'
   destroyed = false
@@ -55,7 +56,7 @@ class FakeWindow extends EventEmitter {
           const states: Record<string, string> = {
             'https://z.ai/manage-apikey/coding-plan/personal/usage': 'Usage Weekly Quota 21 % Used Reset Time: 2026-08-30 12:46',
             'https://grok.com/?_s=usage': 'Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück',
-            'https://claude.ai/new#settings/usage': 'Nutzung Alle Modelle Zurücksetzung Sa., 14:59 31 % verwendet',
+            'https://claude.ai/new#settings/usage': FakeWindow.claudeUsageText || 'Nutzung Alle Modelle Zurücksetzung Sa., 14:59 31 % verwendet',
             'https://chatgpt.com/codex/cloud/settings/analytics#usage': 'Weekly usage limit 91% remaining Resets Aug 31, 2026 9:02 AM'
           }
           let text = states[this.currentUrl] || ''
@@ -242,6 +243,43 @@ test('opens Claude usage via hashchange, not static #settings/usage', async () =
     assert.equal(FakeWindow.last?.hashOpenedViaJs, true)
   } finally {
     FakeWindow.ignoreStaticClaudeHash = false
+    await service.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('accepts Claude Diese-Woche usage card without Alle Modelle', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-claude-week-'))
+  const session = new FakeSession()
+  FakeWindow.ignoreStaticClaudeHash = true
+  FakeWindow.claudeUsageText = [
+    'Dein Verbrauch Max (20x)',
+    'Neue Woche. 5 % deines wöchentlichen Limits verwendet.',
+    'Aktuelle Sitzung 3 % verwendet',
+    'Diese Woche Zurücksetzung Samstag, 15:00 5 % verwendet',
+  ].join('\n')
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
+    fromPartition: () => session,
+    now: () => new Date('2026-09-12T14:54:00.000Z')
+  })
+
+  try {
+    await service.start()
+    const { socketPath, tokenPath } = service.getPaths()
+    const token = readFileSync(tokenPath, 'utf8').trim()
+    const accepted = await rpc(socketPath, token, 'POST', '/measure', { providers: ['claude'] })
+    assert.equal(accepted.status, 202)
+    const result = await waitForComplete(socketPath, token, accepted.body.run_id)
+    assert.equal(result.status, 'complete')
+    assert.equal(result.providers.claude.status, 'ok')
+    assert.match(String(result.providers.claude.quote || ''), /Diese Woche/)
+  } finally {
+    FakeWindow.ignoreStaticClaudeHash = false
+    FakeWindow.claudeUsageText = ''
     await service.stop()
     await rm(root, { recursive: true, force: true })
   }
