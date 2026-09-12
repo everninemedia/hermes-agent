@@ -53,6 +53,7 @@ export type BudgetMeasureServiceDeps = {
   logger?: (message: string) => void
   now?: () => Date
   challengeGraceMs?: number
+  hashSettleMs?: number
   chmodSocket?: (path: string, mode: number) => void
 }
 
@@ -96,6 +97,7 @@ const WINDOW_HEIGHT = 800
 const NAVIGATION_TIMEOUT_MS = 20_000
 const PROVIDER_TIMEOUT_MS = 45_000
 const WAIT_TIMEOUT_MS = 30_000
+const CLAUDE_HASH_SETTLE_MS = 600
 const RUN_TIMEOUT_MS = 150_000
 const RESULT_TTL_MS = 10 * 60_000
 const CHALLENGE_GRACE_MS = 16_000
@@ -307,6 +309,11 @@ function timeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> 
   })
 }
 
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) {return Promise.resolve()}
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 function writeSecret(path: string, value: string) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
   writeFileSync(path, `${value}\n`, { encoding: 'utf8', mode: TOKEN_MODE })
@@ -352,6 +359,7 @@ export class BudgetMeasureService {
   private readonly deps: Required<Pick<BudgetMeasureServiceDeps, 'BrowserWindow' | 'fromPartition'>> & BudgetMeasureServiceDeps
   private readonly now: () => Date
   private readonly challengeGraceMs: number
+  private readonly hashSettleMs: number
   private readonly socketPath: string
   private readonly tokenPath: string
   private readonly results = new Map<string, { run: BudgetMeasureRun; expiresAt: number }>()
@@ -374,6 +382,7 @@ export class BudgetMeasureService {
     this.deps = deps as any
     this.now = deps.now || (() => new Date())
     this.challengeGraceMs = Math.max(0, deps.challengeGraceMs ?? CHALLENGE_GRACE_MS)
+    this.hashSettleMs = Math.max(0, deps.hashSettleMs ?? CLAUDE_HASH_SETTLE_MS)
     const paths = budgetMeasurePaths(deps.appDataPath)
     this.socketPath = paths.socketPath
     this.tokenPath = paths.tokenPath
@@ -781,11 +790,28 @@ export class BudgetMeasureService {
     this.openWindowHandler = null
   }
 
+  private async openProviderUsage(window: WindowLike, provider: ProviderId, deadline: number): Promise<void> {
+    const spec = PROVIDER_CONFIG[provider]
+    const navMs = Math.min(NAVIGATION_TIMEOUT_MS, Math.max(1, deadline - Date.now()))
+    if (provider !== 'claude') {
+      await timeout(window.loadURL(spec.url, { timeout: NAVIGATION_TIMEOUT_MS }), navMs, 'navigation_timeout')
+      return
+    }
+
+    // Claude oeffnet das Usage-Modal seit 2026-06-29 nicht mehr beim Laden einer
+    // URL mit statischem #settings/usage (kein hashchange). Erst claude.ai/new,
+    // dann Hash leeren und neu setzen. Gleicher Tanz wie scrape-budgets.mjs.
+    await timeout(window.loadURL(spec.warmup, { timeout: NAVIGATION_TIMEOUT_MS }), navMs, 'navigation_timeout')
+    await window.webContents.executeJavaScript('location.hash = ""; void 0')
+    await sleep(this.hashSettleMs)
+    await window.webContents.executeJavaScript('location.hash = "#settings/usage"; void 0')
+  }
+
   private async measureProvider(window: WindowLike, provider: ProviderId, signal: AbortSignal, limitMs: number): Promise<BudgetMeasureProviderResult> {
     const deadline = Date.now() + Math.max(1000, limitMs)
 
     try {
-      await timeout(window.loadURL(PROVIDER_CONFIG[provider].url, { timeout: NAVIGATION_TIMEOUT_MS }), Math.min(NAVIGATION_TIMEOUT_MS, deadline - Date.now()), 'navigation_timeout')
+      await this.openProviderUsage(window, provider, deadline)
     } catch (error: any) {
       try { window.webContents.stop?.() } catch { /* stop is best effort after navigation failure */ }
 

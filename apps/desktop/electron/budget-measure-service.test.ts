@@ -19,12 +19,14 @@ class FakeSession extends EventEmitter {
 class FakeWindow extends EventEmitter {
   static delayMs = 0
   static missingEvidence = false
+  static ignoreStaticClaudeHash = false
   static last: FakeWindow | null = null
   currentUrl = 'about:blank'
   destroyed = false
   session: FakeSession
   webContents: any
   removedEvents: string[] = []
+  hashOpenedViaJs = false
 
   constructor(options: any) {
     super()
@@ -40,6 +42,15 @@ class FakeWindow extends EventEmitter {
       },
       stop: () => {},
       executeJavaScript: async (code: string) => {
+        const hashAssign = code.match(/location\.hash\s*=\s*(['"])(.*?)\1/)
+        if (hashAssign) {
+          const hash = hashAssign[2]
+          const base = this.currentUrl.split('#')[0]
+          this.currentUrl = hash ? `${base}${hash.startsWith('#') ? hash : `#${hash}`}` : base
+          this.hashOpenedViaJs = /settings\/usage/i.test(hash)
+          return hash
+        }
+
         if (code.includes('url: location.href')) {
           const states: Record<string, string> = {
             'https://z.ai/manage-apikey/coding-plan/personal/usage': 'Usage Weekly Quota 21 % Used Reset Time: 2026-08-30 12:46',
@@ -47,8 +58,17 @@ class FakeWindow extends EventEmitter {
             'https://claude.ai/new#settings/usage': 'Nutzung Alle Modelle Zurücksetzung Sa., 14:59 31 % verwendet',
             'https://chatgpt.com/codex/cloud/settings/analytics#usage': 'Weekly usage limit 91% remaining Resets Aug 31, 2026 9:02 AM'
           }
+          let text = states[this.currentUrl] || ''
+          if (
+            FakeWindow.ignoreStaticClaudeHash
+            && /claude\.ai/i.test(this.currentUrl)
+            && /#settings\/usage/i.test(this.currentUrl)
+            && !this.hashOpenedViaJs
+          ) {
+            text = 'Claude Chat Wie kann ich dir heute helfen?'
+          }
 
-          return { url: this.currentUrl, title: 'provider', text: states[this.currentUrl] || '' }
+          return { url: this.currentUrl, title: 'provider', text }
         }
 
         if (FakeWindow.missingEvidence) {return {}}
@@ -70,6 +90,9 @@ class FakeWindow extends EventEmitter {
 
   loadURL(url: string) {
     this.currentUrl = url
+    if (/claude\.ai/i.test(url) && /#settings\/usage/i.test(url)) {
+      this.hashOpenedViaJs = false
+    }
 
     return FakeWindow.delayMs > 0 ? new Promise<void>(resolve => setTimeout(resolve, FakeWindow.delayMs)) : Promise.resolve()
   }
@@ -144,6 +167,7 @@ test('D1 RPC authenticates, enforces one run, and returns normalized provider re
   const service = new BudgetMeasureService({
     appDataPath: root,
     BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
     fromPartition: () => session,
     now: () => new Date('2026-08-25T08:08:00.000Z')
   })
@@ -192,6 +216,37 @@ test('D1 RPC authenticates, enforces one run, and returns normalized provider re
   }
 })
 
+test('opens Claude usage via hashchange, not static #settings/usage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-claude-hash-'))
+  const session = new FakeSession()
+  FakeWindow.ignoreStaticClaudeHash = true
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
+    fromPartition: () => session,
+    now: () => new Date('2026-08-25T08:08:00.000Z')
+  })
+
+  try {
+    await service.start()
+    const { socketPath, tokenPath } = service.getPaths()
+    const token = readFileSync(tokenPath, 'utf8').trim()
+    const accepted = await rpc(socketPath, token, 'POST', '/measure', { providers: ['claude'] })
+    assert.equal(accepted.status, 202)
+    const result = await waitForComplete(socketPath, token, accepted.body.run_id)
+    assert.equal(result.status, 'complete')
+    assert.equal(result.providers.claude.status, 'ok')
+    assert.match(String(result.providers.claude.quote || ''), /31/)
+    assert.equal(FakeWindow.last?.hashOpenedViaJs, true)
+  } finally {
+    FakeWindow.ignoreStaticClaudeHash = false
+    await service.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('busy is released before park so the next measure is accepted', async () => {
   const root = await mkdtemp(join(tmpdir(), 'hermes-budget-park-'))
   const session = new FakeSession()
@@ -199,6 +254,7 @@ test('busy is released before park so the next measure is accepted', async () =>
   const service = new BudgetMeasureService({
     appDataPath: root,
     BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
     fromPartition: () => session,
     now: () => new Date('2026-08-25T08:08:00.000Z')
   })
@@ -237,6 +293,7 @@ test('stale socket without a live server is replaced and a live socket is a star
   const first = new BudgetMeasureService({
     appDataPath: root,
     BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
     fromPartition: () => session,
     now: () => new Date('2026-08-25T08:08:00.000Z')
   })
@@ -244,6 +301,7 @@ test('stale socket without a live server is replaced and a live socket is a star
   const second = new BudgetMeasureService({
     appDataPath: root,
     BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
     fromPartition: () => session,
     now: () => new Date('2026-08-25T08:08:00.000Z')
   })
@@ -264,6 +322,7 @@ test('renderer crash handler is removed on teardown', async () => {
   const service = new BudgetMeasureService({
     appDataPath: root,
     BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
     fromPartition: () => session,
     now: () => new Date('2026-08-25T08:08:00.000Z')
   })
@@ -289,6 +348,7 @@ test('socket chmod failure is fail-closed', async () => {
   const service = new BudgetMeasureService({
     appDataPath: root,
     BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
     fromPartition: () => session,
     now: () => new Date('2026-08-25T08:08:00.000Z'),
     chmodSocket: () => {
