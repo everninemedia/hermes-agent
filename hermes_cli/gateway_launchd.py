@@ -403,10 +403,20 @@ def _launchd_extra_env_lost(plist_path: Path, new_plist: str) -> list[str]:
         installed_keys = {k for k in _LAUNCHD_EXTRA_ENV_ALLOWLIST if installed_env.get(k)}
     except Exception:
         # A damaged plist still counts as carrying a key whose name appears in it.
+        # Fail-closed boundary: the traceback is logged for diagnosis, never the plist bytes.
+        logger = _gw().logger
+        logger.warning(
+            "installed launchd plist %s unparseable; scanning raw bytes for allowlisted keys",
+            plist_path, exc_info=True)
         installed_keys = {k for k in _LAUNCHD_EXTRA_ENV_ALLOWLIST if k.encode() in raw_installed}
     try:
         new_env = plistlib.loads(new_plist.encode("utf-8")).get("EnvironmentVariables") or {}
     except Exception:
+        # Fail-closed boundary: log the traceback (the definition body itself stays out of the log).
+        logger = _gw().logger
+        logger.warning(
+            "new launchd plist definition unparseable; treating every allowlisted key as dropped",
+            exc_info=True)
         new_env = {}  # unparseable new definition counts as dropping every protected key
     return [k for k in _LAUNCHD_EXTRA_ENV_ALLOWLIST if k in installed_keys and not new_env.get(k)]
 

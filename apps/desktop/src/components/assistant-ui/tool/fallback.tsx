@@ -345,6 +345,42 @@ function useDisclosureOpen(disclosureId: string, fallbackOpen = false): boolean 
   return persistedOpen ?? fallbackOpen
 }
 
+// File contents and diffs are reference material in the transcript. Keep
+// them folded on first render just like settled activity runs; the user can
+// still open a specific row when they want to inspect it. The fold is local:
+// reference rows never read or persist an open state, and mounting one clears
+// stale persisted intent left by an earlier non-reference render.
+function useReferenceDisclosure(
+  disclosureId: string,
+  toolName: string,
+  inlineDiff: unknown
+): { disclosureOpen: boolean; openDisclosure: (nextOpen: boolean, runDisclosureId: string | null) => void } {
+  const isTranscriptReference = toolName === 'read_file' || Boolean(inlineDiff)
+  const persistedOpen = useDisclosureOpen(disclosureId)
+  const [referenceOpen, setReferenceOpen] = useState(false)
+
+  useEffect(() => {
+    if (!isTranscriptReference) {return}
+    setToolDisclosureOpen(disclosureId, false)
+    return () => setToolDisclosureOpen(disclosureId, false)
+  }, [disclosureId, isTranscriptReference])
+
+  const openDisclosure = (nextOpen: boolean, runDisclosureId: string | null) => {
+    // Opening a row is newer intent than an earlier group collapse.
+    if (nextOpen && runDisclosureId) {
+      setToolDisclosureOpen(runDisclosureId, true)
+    }
+
+    if (isTranscriptReference) {setReferenceOpen(nextOpen)}
+    setToolDisclosureOpen(disclosureId, nextOpen)
+  }
+
+  return {
+    disclosureOpen: isTranscriptReference ? referenceOpen : persistedOpen,
+    openDisclosure
+  }
+}
+
 /** A running row's trailing meta: live MCP progress (`42% · message`, when the server sends it) + the timer. */
 function ToolRunningMeta({ seconds, toolCallId = '' }: { seconds: number; toolCallId?: string }) {
   const sessionId = useStore(useSessionView().$runtimeId) ?? ''
@@ -424,13 +460,7 @@ function ToolEntry({ part }: ToolEntryProps) {
   const isPending = messageRunning && result === undefined && completedAt === undefined
   const inlineDiff = inlineDiffFromResult(toolResultRecord(stablePart))
   const isFileEdit = isFileEditTool(toolName)
-  // File contents and diffs are reference material in the transcript. Keep
-  // them folded on first render just like settled activity runs; the user can
-  // still open a specific row when they want to inspect it.
-  const isTranscriptReference = toolName === 'read_file' || Boolean(inlineDiff)
-  const persistedOpen = useDisclosureOpen(disclosureId)
-  const [referenceOpen, setReferenceOpen] = useState(false)
-  const disclosureOpen = isTranscriptReference ? referenceOpen : persistedOpen
+  const { disclosureOpen, openDisclosure } = useReferenceDisclosure(disclosureId, toolName, inlineDiff)
   const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively
   // streaming — historical sessions mount with `messageRunning === false`,
@@ -438,12 +468,6 @@ function ToolEntry({ part }: ToolEntryProps) {
   // handles its own enter animation, so embedded children skip it.
   const enterRef = useEnterAnimation(messageRunning && !embedded, `tool-entry:${disclosureId}`)
   const elapsed = useElapsedSeconds(isPending, `tool:${disclosureId}`)
-
-  useEffect(() => {
-    if (!isTranscriptReference) {return}
-    setToolDisclosureOpen(disclosureId, false)
-    return () => setToolDisclosureOpen(disclosureId, false)
-  }, [disclosureId, isTranscriptReference])
 
   // A stopped turn is not evidence that an unobserved tool succeeded. Use a
   // presentation-only completion marker, never manufacture a result.
@@ -629,19 +653,7 @@ function ToolEntry({ part }: ToolEntryProps) {
       <div className={cn(open && 'border-b border-(--ui-stroke-tertiary) px-2 py-1.5')}>
         <DisclosureRow
           action={dismissAction}
-          onToggle={
-            hasExpandableContent
-              ? () => {
-                  // Opening a row is newer intent than an earlier group collapse.
-                  if (!open && runDisclosureId) {
-                    setToolDisclosureOpen(runDisclosureId, true)
-                  }
-
-                  if (isTranscriptReference) {setReferenceOpen(!open)}
-                  setToolDisclosureOpen(disclosureId, !open)
-                }
-              : undefined
-          }
+          onToggle={hasExpandableContent ? () => openDisclosure(!open, runDisclosureId) : undefined}
           open={open}
           trailing={trailing}
         >

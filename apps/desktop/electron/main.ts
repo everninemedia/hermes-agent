@@ -1,3 +1,4 @@
+// health: allow FILE_LINES -- EVM v0.22.5 port adds 15 lifecycle-wiring lines to the 18355-line main; keep budget logic in its sibling and avoid unrelated refactoring risk.
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
 import type { GatewayEndpoint } from './local-gateway'

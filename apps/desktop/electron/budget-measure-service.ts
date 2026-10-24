@@ -868,18 +868,54 @@ export class BudgetMeasureService {
     try {
       await this.openProviderUsage(window, provider, deadline)
     } catch (error: any) {
-      try { window.webContents.stop?.() } catch { /* stop is best effort after navigation failure */ }
-
-      if (signal.aborted) {return this.failure('desktop_down', 'Messung abgebrochen')}
-
-      if (error?.message === 'navigation_timeout') {return this.failure('timeout', 'Navigation-Timeout')}
-
-      return this.failure('desktop_down', 'Navigation fehlgeschlagen')
+      return this.navigationFailure(window, signal, error)
     }
 
+    return this.waitForProviderContent(window, provider, signal, deadline)
+  }
+
+  private navigationFailure(window: WindowLike, signal: AbortSignal, error: any): BudgetMeasureProviderResult {
+    try { window.webContents.stop?.() } catch { /* stop is best effort after navigation failure */ }
+
+    if (signal.aborted) {return this.failure('desktop_down', 'Messung abgebrochen')}
+
+    if (error?.message === 'navigation_timeout') {return this.failure('timeout', 'Navigation-Timeout')}
+
+    return this.failure('desktop_down', 'Navigation fehlgeschlagen')
+  }
+
+  private pageText(state: any): string {
+    return String(state?.text || '')
+  }
+
+  private pageUrl(provider: ProviderId, state: any): string {
+    return String(state?.url || PROVIDER_CONFIG[provider].url)
+  }
+
+  private isChallengePage(provider: ProviderId, state: any): boolean {
+    return this.isChallenge(this.pageUrl(provider, state), this.pageText(state))
+  }
+
+  private isLoginPage(provider: ProviderId, state: any): boolean {
+    const text = this.pageText(state)
+
+    return Boolean(text) && LOGIN_RE.test(text) && !PROVIDER_CONFIG[provider].marker.test(text)
+  }
+
+  private isMarkerPage(provider: ProviderId, state: any): boolean {
+    const text = this.pageText(state)
+
+    return Boolean(text) && PROVIDER_CONFIG[provider].marker.test(text)
+  }
+
+  private grokBotCardMissing(provider: ProviderId, state: any): boolean {
+    return provider === 'grok' && !GROK_BOT_CARD_RE.test(this.pageText(state))
+  }
+
+  private async waitForProviderContent(window: WindowLike, provider: ProviderId, signal: AbortSignal, deadline: number): Promise<BudgetMeasureProviderResult> {
     let challengeAt = 0
-    let lastState: any = null
     let grokBotWaitAt = 0
+    let lastState: any = null
 
     while (!signal.aborted && Date.now() < deadline) {
       if (window.isDestroyed() || window.webContents.isDestroyed?.()) {
@@ -887,31 +923,35 @@ export class BudgetMeasureService {
       }
 
       lastState = await this.readPageState(window)
-      const text = String(lastState?.text || '')
-      const url = String(lastState?.url || PROVIDER_CONFIG[provider].url)
 
-      if (this.isChallenge(url, text)) {
+      if (this.isChallengePage(provider, lastState)) {
         challengeAt ||= Date.now()
 
         if (Date.now() - challengeAt >= CHALLENGE_GRACE_MS) {
           return this.failure('challenge', 'Challenge-Seite erkannt')
         }
-      } else if (text && LOGIN_RE.test(text) && !PROVIDER_CONFIG[provider].marker.test(text)) {
+      } else if (this.isLoginPage(provider, lastState)) {
         return this.failure('auth_required', 'Anmeldung im Hermes-Preview erforderlich')
-      } else if (text && PROVIDER_CONFIG[provider].marker.test(text)) {
-        if (provider === 'grok' && !GROK_BOT_CARD_RE.test(text)) {
+      } else if (this.isMarkerPage(provider, lastState)) {
+        if (this.grokBotCardMissing(provider, lastState)) {
           grokBotWaitAt ||= Date.now()
+
           if (Date.now() - grokBotWaitAt < this.grokBotGraceMs && Date.now() + POLL_MS < deadline) {
-            await new Promise(resolve => setTimeout(resolve, POLL_MS))
+            await sleep(POLL_MS)
             continue
           }
         }
+
         return this.extractProviderResult(window, provider, lastState)
       }
 
-      await new Promise(resolve => setTimeout(resolve, POLL_MS))
+      await sleep(POLL_MS)
     }
 
+    return this.structureFailure(signal, lastState)
+  }
+
+  private structureFailure(signal: AbortSignal, lastState: any): BudgetMeasureProviderResult {
     if (signal.aborted) {return this.failure('desktop_down', 'Messung abgebrochen')}
     const detail = lastState?.text ? 'Provider-Seite geladen, Struktur unbekannt' : 'Provider-Seite ohne lesbaren Inhalt'
     const failed = this.failure(lastState?.text ? 'structure_unknown' : 'timeout', detail)
@@ -935,69 +975,16 @@ export class BudgetMeasureService {
   }
 
   private async extractProviderResult(window: WindowLike, provider: ProviderId, state: any): Promise<BudgetMeasureProviderResult> {
-    let extracted: any = {}
-
-    try {
-      extracted = await timeout(window.webContents.executeJavaScript(PROVIDER_EXTRACT_JS[provider], false), 5000, 'dom_extract_timeout')
-    } catch {
-      extracted = {}
-    }
-
+    const extracted = await this.readProviderDom(window, provider)
     const cardProof = this.usageCardProof(state?.text)
-    const requiredEvidence = provider === 'zai'
-      ? Boolean(extracted.accountAvatar) || cardProof
-      : provider === 'claude'
-        ? Boolean(extracted.accountMarker) || cardProof
-        : provider === 'codex'
-          ? Boolean(extracted.planBadge) || cardProof
-          : /^@[A-Za-z0-9_]{2,}$/.test(String(extracted.handle || '')) || cardProof
 
-    if (!requiredEvidence) {
+    if (!this.hasAccountEvidence(provider, extracted, cardProof)) {
       return this.failure('structure_unknown', 'Konto-Nachweis im Messfenster fehlt')
     }
 
     const quote = compactText(state?.text || '')
     const pageUrl = safePageUrl(state?.url || PROVIDER_CONFIG[provider].url)
-    const appendixParts: string[] = []
-
-    if (provider === 'zai' && extracted.accountAvatar) {appendixParts.push(`[DOM Konto-Avatar: ${compactText(extracted.accountAvatar, 20)}]`)}
-
-    if (provider === 'claude' && extracted.accountMarker) {appendixParts.push(`[DOM Nutzer-Knopf: ${compactText(extracted.accountMarker, 80)}]`)}
-
-    if (provider === 'codex' && extracted.planBadge) {appendixParts.push(`[DOM Profil-Badge: ${compactText(extracted.planBadge, 20)}]`)}
-    let grokDom: any = undefined
-
-    if (provider === 'grok') {
-      const handle = /^@[A-Za-z0-9_]{2,}$/.test(String(extracted.handle || '')) ? extracted.handle : ''
-      const cardParts = [extracted.cardHead, extracted.text, extracted.aria ? `aria-label: ${extracted.aria}` : ''].filter(Boolean)
-
-      if (cardParts.length) {appendixParts.push(`[Nutzungs-Karte: ${compactText(cardParts.join(' | '), 2000)}]`)}
-
-      // Grok Bot: zweite Karte als eigener Anhang, damit die Belegprüfung des
-      // Trackers den Bot-Prozentwert als Token im Anhang findet.
-      const bot = extracted.bot && typeof extracted.bot === 'object' ? extracted.bot : null
-      if (bot) {
-        const botParts = [bot.cardHead, bot.text, bot.aria ? `aria-label: ${bot.aria}` : ''].filter(Boolean)
-        if (botParts.length) {appendixParts.push(`[Nutzungs-Karte Grok Bot: ${compactText(botParts.join(' | '), 1000)}]`)}
-      }
-
-      if (handle) {appendixParts.push(`[DOM Konto-Handle: ${handle}]`)}
-      grokDom = {
-        aria: extracted.aria ? redactBudgetOutput(String(extracted.aria)).slice(0, 200) : null,
-        breakdown: Array.isArray(extracted.breakdown) ? extracted.breakdown.map(item => ({
-          label: compactText(item?.label, 120),
-          pct: String(item?.pct || '').slice(0, 20)
-        })) : [],
-        text: compactText(extracted.text, 2000),
-        cardHead: compactText(extracted.cardHead, 200),
-        bot: bot ? {
-          aria: bot.aria ? redactBudgetOutput(String(bot.aria)).slice(0, 200) : null,
-          text: compactText(bot.text, 1000),
-          cardHead: compactText(bot.cardHead, 200)
-        } : null
-      }
-    }
-
+    const { appendixParts, grokDom } = this.providerEvidence(provider, extracted)
     const domAppendix = appendixParts.join(' ')
 
     const evidence = {
@@ -1015,6 +1002,69 @@ export class BudgetMeasureService {
       dom_appendix: domAppendix,
       evidence,
       grok_dom: grokDom
+    }
+  }
+
+  private async readProviderDom(window: WindowLike, provider: ProviderId): Promise<any> {
+    try {
+      return await timeout(window.webContents.executeJavaScript(PROVIDER_EXTRACT_JS[provider], false), 5000, 'dom_extract_timeout')
+    } catch {
+      return {}
+    }
+  }
+
+  private hasAccountEvidence(provider: ProviderId, extracted: any, cardProof: boolean): boolean {
+    if (provider === 'zai') {return Boolean(extracted.accountAvatar) || cardProof}
+    if (provider === 'claude') {return Boolean(extracted.accountMarker) || cardProof}
+    if (provider === 'codex') {return Boolean(extracted.planBadge) || cardProof}
+
+    return /^@[A-Za-z0-9_]{2,}$/.test(String(extracted.handle || '')) || cardProof
+  }
+
+  private providerEvidence(provider: ProviderId, extracted: any): { appendixParts: string[]; grokDom: any } {
+    const appendixParts: string[] = []
+    let grokDom: any = undefined
+
+    if (provider === 'zai' && extracted.accountAvatar) {appendixParts.push(`[DOM Konto-Avatar: ${compactText(extracted.accountAvatar, 20)}]`)}
+
+    if (provider === 'claude' && extracted.accountMarker) {appendixParts.push(`[DOM Nutzer-Knopf: ${compactText(extracted.accountMarker, 80)}]`)}
+
+    if (provider === 'codex' && extracted.planBadge) {appendixParts.push(`[DOM Profil-Badge: ${compactText(extracted.planBadge, 20)}]`)}
+
+    if (provider === 'grok') {grokDom = this.grokEvidence(extracted, appendixParts)}
+
+    return { appendixParts, grokDom }
+  }
+
+  private grokEvidence(extracted: any, appendixParts: string[]): any {
+    const handle = /^@[A-Za-z0-9_]{2,}$/.test(String(extracted.handle || '')) ? extracted.handle : ''
+    const cardParts = [extracted.cardHead, extracted.text, extracted.aria ? `aria-label: ${extracted.aria}` : ''].filter(Boolean)
+
+    if (cardParts.length) {appendixParts.push(`[Nutzungs-Karte: ${compactText(cardParts.join(' | '), 2000)}]`)}
+
+    // Grok Bot: zweite Karte als eigener Anhang, damit die Belegprüfung des
+    // Trackers den Bot-Prozentwert als Token im Anhang findet.
+    const bot = extracted.bot && typeof extracted.bot === 'object' ? extracted.bot : null
+    if (bot) {
+      const botParts = [bot.cardHead, bot.text, bot.aria ? `aria-label: ${bot.aria}` : ''].filter(Boolean)
+      if (botParts.length) {appendixParts.push(`[Nutzungs-Karte Grok Bot: ${compactText(botParts.join(' | '), 1000)}]`)}
+    }
+
+    if (handle) {appendixParts.push(`[DOM Konto-Handle: ${handle}]`)}
+
+    return {
+      aria: extracted.aria ? redactBudgetOutput(String(extracted.aria)).slice(0, 200) : null,
+      breakdown: Array.isArray(extracted.breakdown) ? extracted.breakdown.map(item => ({
+        label: compactText(item?.label, 120),
+        pct: String(item?.pct || '').slice(0, 20)
+      })) : [],
+      text: compactText(extracted.text, 2000),
+      cardHead: compactText(extracted.cardHead, 200),
+      bot: bot ? {
+        aria: bot.aria ? redactBudgetOutput(String(bot.aria)).slice(0, 200) : null,
+        text: compactText(bot.text, 1000),
+        cardHead: compactText(bot.cardHead, 200)
+      } : null
     }
   }
 }

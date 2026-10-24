@@ -4,7 +4,7 @@ from agent.turn_request_assembly import (
     _append_iteration_closeout_nudge,
     _iteration_closeout_policy,
 )
-from agent.chat_completion_helpers import (
+from agent.chat_completion_helpers_closeout import (
     _force_toolless_request,
     _local_iteration_checkpoint,
 )

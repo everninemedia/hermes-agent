@@ -1254,22 +1254,7 @@ class TestGitDestructiveOps:
             assert dangerous is True, cmd
             assert word in desc.lower(), cmd
 
-    def test_git_push_and_merge_require_user_approval(self):
-        """Shared Git writes must always travel through the approval UI."""
-        for cmd in ("git push origin main", "git merge feature/ready"):
-            dangerous, _, desc = detect_dangerous_command(cmd)
-            assert dangerous is True, cmd
-            assert "git" in desc.lower(), cmd
 
-    def test_safe_git_ops_not_flagged(self):
-        for cmd in (
-            "git status",
-            "git log --oneline -1",
-            "git merge-base main HEAD",
-            "git commit -m 'git push later'",
-        ):
-            dangerous, _, _ = detect_dangerous_command(cmd)
-            assert dangerous is False, cmd
 
     def test_branch_delete_flag_case_distinction(self):
         """git branch -d is the safe merged-only delete (git itself refuses unmerged

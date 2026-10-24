@@ -29,6 +29,25 @@ class FakeWindow extends EventEmitter {
   static grokReads = 0
   static last: FakeWindow | null = null
   static lastOptions: any = null
+  // Fake-Antworten je Provider-Extraktion: der Service sendet die echten
+  // PROVIDER_EXTRACT_JS-Strings; der Fake erkennt sie am Markwort im Code und
+  // antwortet in derselben Reihenfolge wie die bisherige Zweigleiter.
+  static readonly domResponses: Array<{ marker: string; respond: () => any }> = [
+    { marker: 'accountAvatar', respond: () => ({ accountAvatar: 'T' }) },
+    { marker: 'accountMarker', respond: () => ({ accountMarker: 'Tobi' }) },
+    { marker: 'planBadge', respond: () => ({ planBadge: 'PRO' }) },
+    {
+      marker: 'handle',
+      respond: () => ({
+        handle: '@tobi',
+        aria: '53%',
+        breakdown: [{ label: 'Grok Build', pct: '53' }],
+        text: 'Grok Build 53%',
+        cardHead: 'Wöchentliches SuperGrok Heavy-Limit',
+        bot: FakeWindow.grokReads > FakeWindow.grokBotAfterReads ? FakeWindow.grokBot : null
+      })
+    }
+  ]
   currentUrl = 'about:blank'
   destroyed = false
   session: FakeSession
@@ -47,6 +66,57 @@ class FakeWindow extends EventEmitter {
     this.hiddenInMissionControl = hidden
   }
 
+  // location.hash-Zuweisung des Claude-Hash-Tanzes nachbilden: URL anpassen
+  // und merken, ob der Hash per JavaScript gesetzt wurde.
+  private applyHashAssign(code: string): string | null {
+    const hashAssign = code.match(/location\.hash\s*=\s*(['"])(.*?)\1/)
+
+    if (!hashAssign) {return null}
+
+    const hash = hashAssign[2]
+    const base = this.currentUrl.split('#')[0]
+    this.currentUrl = hash ? `${base}${hash.startsWith('#') ? hash : `#${hash}`}` : base
+    this.hashOpenedViaJs = /settings\/usage/i.test(hash)
+
+    return hash
+  }
+
+  // PAGE_STATE_JS beantworten: statischer Seitentext je Provider-URL, mit
+  // Grok-Lesezaehler und Bot-Karte erst nach grokBotAfterReads Lesevorgaengen.
+  private pageState(): { url: string; title: string; text: string } {
+    if (/grok\.com/.test(this.currentUrl)) {FakeWindow.grokReads += 1}
+
+    const botVisible = FakeWindow.grokBot && FakeWindow.grokReads > FakeWindow.grokBotAfterReads
+    const states: Record<string, string> = {
+      'https://z.ai/manage-apikey/coding-plan/personal/usage': 'Usage Weekly Quota 21 % Used Reset Time: 2026-08-30 12:46',
+      'https://grok.com/?_s=usage': botVisible && FakeWindow.grokBot
+        ? `Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück ${FakeWindow.grokBot.cardHead} ${FakeWindow.grokBot.text}`
+        : 'Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück',
+      'https://claude.ai/new#settings/usage': FakeWindow.claudeUsageText || 'Nutzung Alle Modelle Zurücksetzung Sa., 14:59 31 % verwendet',
+      'https://chatgpt.com/codex/cloud/settings/analytics#usage': 'Weekly usage limit 91% remaining Resets Aug 31, 2026 9:02 AM'
+    }
+    let text = states[this.currentUrl] || ''
+
+    if (
+      FakeWindow.ignoreStaticClaudeHash
+      && /claude\.ai/i.test(this.currentUrl)
+      && /#settings\/usage/i.test(this.currentUrl)
+      && !this.hashOpenedViaJs
+    ) {
+      text = 'Claude Chat Wie kann ich dir heute helfen?'
+    }
+
+    return { url: this.currentUrl, title: 'provider', text }
+  }
+
+  private domQuery(code: string): any {
+    if (FakeWindow.missingEvidence) {return {}}
+
+    const match = FakeWindow.domResponses.find(entry => code.includes(entry.marker))
+
+    return match ? match.respond() : {}
+  }
+
   constructor(options: any) {
     super()
     FakeWindow.last = this
@@ -62,59 +132,13 @@ class FakeWindow extends EventEmitter {
       },
       stop: () => {},
       executeJavaScript: async (code: string) => {
-        const hashAssign = code.match(/location\.hash\s*=\s*(['"])(.*?)\1/)
-        if (hashAssign) {
-          const hash = hashAssign[2]
-          const base = this.currentUrl.split('#')[0]
-          this.currentUrl = hash ? `${base}${hash.startsWith('#') ? hash : `#${hash}`}` : base
-          this.hashOpenedViaJs = /settings\/usage/i.test(hash)
-          return hash
-        }
+        const hash = this.applyHashAssign(code)
 
-        if (code.includes('url: location.href')) {
-          if (/grok\.com/.test(this.currentUrl)) {FakeWindow.grokReads += 1}
-          const botVisible = FakeWindow.grokBot && FakeWindow.grokReads > FakeWindow.grokBotAfterReads
-          const states: Record<string, string> = {
-            'https://z.ai/manage-apikey/coding-plan/personal/usage': 'Usage Weekly Quota 21 % Used Reset Time: 2026-08-30 12:46',
-            'https://grok.com/?_s=usage': botVisible && FakeWindow.grokBot
-              ? `Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück ${FakeWindow.grokBot.cardHead} ${FakeWindow.grokBot.text}`
-              : 'Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück',
-            'https://claude.ai/new#settings/usage': FakeWindow.claudeUsageText || 'Nutzung Alle Modelle Zurücksetzung Sa., 14:59 31 % verwendet',
-            'https://chatgpt.com/codex/cloud/settings/analytics#usage': 'Weekly usage limit 91% remaining Resets Aug 31, 2026 9:02 AM'
-          }
-          let text = states[this.currentUrl] || ''
-          if (
-            FakeWindow.ignoreStaticClaudeHash
-            && /claude\.ai/i.test(this.currentUrl)
-            && /#settings\/usage/i.test(this.currentUrl)
-            && !this.hashOpenedViaJs
-          ) {
-            text = 'Claude Chat Wie kann ich dir heute helfen?'
-          }
+        if (hash !== null) {return hash}
 
-          return { url: this.currentUrl, title: 'provider', text }
-        }
+        if (code.includes('url: location.href')) {return this.pageState()}
 
-        if (FakeWindow.missingEvidence) {return {}}
-
-        if (code.includes('accountAvatar')) {return { accountAvatar: 'T' }}
-
-        if (code.includes('accountMarker')) {return { accountMarker: 'Tobi' }}
-
-        if (code.includes('planBadge')) {return { planBadge: 'PRO' }}
-
-        if (code.includes('handle')) {
-          return {
-            handle: '@tobi',
-            aria: '53%',
-            breakdown: [{ label: 'Grok Build', pct: '53' }],
-            text: 'Grok Build 53%',
-            cardHead: 'Wöchentliches SuperGrok Heavy-Limit',
-            bot: FakeWindow.grokReads > FakeWindow.grokBotAfterReads ? FakeWindow.grokBot : null
-          }
-        }
-
-        return {}
+        return this.domQuery(code)
       }
     }
   }
