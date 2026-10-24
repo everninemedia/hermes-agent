@@ -845,15 +845,58 @@ class SessionGatewayMixin:
 
     @staticmethod
     def session_gateway_runtime(session_meta: Optional[dict[str, Any]]) -> dict[str, Any]:
-        """Read the persisted runtime route off a session row dict (``model_config`` as
-        JSON string or parsed dict). Precedence: nested ``gateway_runtime`` (gateway sync /
-        CLI ``/model``), then top-level ``provider``/``base_url``/``api_mode`` (TUI), with
-        ``billing_provider`` filling a missing provider so sessions that never ran ``/model``
-        still restore the provider that served them; a bare ``custom`` billing class falls back
-        to its ``billing_base_url`` endpoint for the readers' bare-custom heal (#136323).
-        Empty dict on parse failure — resume uses ambient config."""
+        """Read the persisted runtime route off a session row dict.
+
+        Accepts the dict returned by ``get_session`` (``model_config`` is a
+        JSON string) or an already-parsed dict. Callers read the model from
+        the ``sessions.model`` column themselves, so the provider returned
+        here has to belong to THAT model. Two axes can disagree:
+
+        * the config axis — ``model_config["model"]``/``["provider"]``
+          (written together by the TUI's ``_runtime_model_config``) and the
+          nested ``gateway_runtime`` (written together with the
+          ``sessions.model`` column by ``_sync_session_model_from_agent``;
+          ``gateway_runtime`` never carries its own ``model`` key),
+        * the billing axis — ``billing_provider``/``billing_base_url``
+          (``update_session_billing_route`` rewrites them on a mid-session
+          model switch WITHOUT the model, so only this axis can go stale
+          half-way; ``update_token_counts`` writes model + billing together
+          on the first accounted call).
+
+        Resolution order:
+
+        1. If ``model_config["model"]`` is non-empty and differs from
+           ``sessions.model``, the config axis is stale relative to the
+           model that last served; a complete billing axis (provider set,
+           not bare, base_url set) wins outright.
+        2. Otherwise the config axis belongs to ``sessions.model``:
+           nested ``gateway_runtime`` with a provider first, then the
+           top-level ``provider``/``base_url``/``api_mode`` keys.
+        3. If the chosen config axis carries no provider but a usable
+           (set, non-bare) ``billing_provider`` exists, the provider is
+           supplemented from the billing axis while base_url/api_mode stay
+           on the config axis.
+        4. If no config axis contributes anything, fall back to
+           ``{"provider": billing_provider}`` alone (set, non-bare).
+
+        The bare ``custom`` billing class is not a routable identity, but it
+        carries the endpoint the session served (``billing_base_url``,
+        #136323): rules 3 and 4 surface the pair as
+        ``{"provider": "custom", "base_url": billing_base_url}`` so the
+        readers' bare-custom heal (``canonical_custom_identity``) can
+        recover ``custom:<name>`` from that endpoint instead of resume
+        recombining the stored model with the ambient default; an endpoint
+        no longer configured still heals to nothing. "auto" bills through
+        the router with no attributable endpoint and stays filtered.
+
+        On a parse failure the config axis is empty, so the result is the
+        billing fallback of rule 4 — an empty dict only when no usable
+        ``billing_provider`` exists either. Never includes a ``model`` key:
+        callers own the model via ``sessions.model``.
+        """
         from hermes_state import _BARE_BILLING_PROVIDERS
-        raw = (session_meta or {}).get("model_config")
+        meta = session_meta or {}
+        raw = meta.get("model_config")
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -861,34 +904,103 @@ class SessionGatewayMixin:
                 raw = {}
         if not isinstance(raw, dict):
             raw = {}
+
+        session_model = str(meta.get("model") or "").strip()
+        config_model = str(raw.get("model") or "").strip()
+        billing_provider = str(meta.get("billing_provider") or "").strip()
+        billing_base_url = str(meta.get("billing_base_url") or "").strip()
+        billing_usable = bool(
+            billing_provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS
+        )
+        # Complete = routable identity AND endpoint. Without base_url the
+        # billing axis must not replace the config axis wholesale (rule 1);
+        # the bare provider alone still qualifies as a supplement (rule 3)
+        # and as the last-resort identity (rule 4).
+        billing_complete = billing_usable and bool(billing_base_url)
+        # Plain CLI turns persist only the billing class "custom" plus the
+        # endpoint they served (#136323): that pair feeds the bare-custom
+        # heal in rules 3/4 below. "auto" has no attributable endpoint.
+        bare_custom_with_endpoint = (
+            billing_provider.lower() == "custom" and bool(billing_base_url)
+        )
+
+        # Rule 1: a non-empty config model that differs from sessions.model
+        # means the top-level config was written for a different model than
+        # the one that last served (measured rows D/E). An empty
+        # sessions.model carries no information to be stale against, so it
+        # never counts as a conflict.
         runtime = raw.get("gateway_runtime")
-        # Filter None: the persist path writes or-None to trigger deletion in the top-level
-        # merge, but gateway_runtime is replaced whole (not deep-merged), so None survives here.
-        if isinstance(runtime, dict) and runtime.get("provider"):
+        nested_has_provider = isinstance(runtime, dict) and bool(runtime.get("provider"))
+
+        # Rule 1 must not outrank a nested gateway_runtime.
+        # ``_sync_session_model_from_agent`` writes gateway_runtime and the
+        # sessions.model column in ONE call and never touches the top-level
+        # ``model`` key, so after a provider fallback the top-level key is
+        # stale BY CONSTRUCTION while gateway_runtime is the fresh half. The
+        # billing axis is frozen at that moment: try_activate_fallback does
+        # not call update_session_billing_route, and update_token_counts
+        # pins billing_provider via COALESCE. Letting a stale top-level model
+        # hand the route to that frozen billing axis reproduces the exact 404
+        # loop this function exists to prevent (adversarial review 2026-08-22,
+        # confirmed by two independent reviewers against a replayed writer
+        # chain). gateway_runtime can never go stale against sessions.model,
+        # so it wins outright.
+        # Filter None values: the persist path writes or-None to trigger
+        # deletion in the top-level merge, but gateway_runtime is replaced
+        # as a whole dict (not deep-merged), so None values survive here.
+        if nested_has_provider:
             return {k: v for k, v in runtime.items() if v is not None}
-        top_level = {key: raw.get(key) for key in ("provider", "base_url", "api_mode") if raw.get(key)}
-        # billing_provider is COALESCE-written on the first accounted API call — the only durable
-        # record for sessions that never ran /model. Bare buckets ("auto"/"custom") are not
-        # routable identities; "auto" is filtered so resume falls back to the ambient default.
-        billing_provider = str((session_meta or {}).get("billing_provider") or "").strip()
-        if billing_provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
-            top_level.setdefault("provider", billing_provider)
-        elif billing_provider.lower() == "custom" and not top_level.get("provider"):
-            # Plain CLI turns persist only the billing class — "custom" — plus the endpoint they
-            # served (billing_base_url, first-accounted overwrite on the row). Surface the pair so
-            # the readers' bare-custom heal (canonical_custom_identity) can recover custom:<name>
-            # from that endpoint instead of resume recombining the stored model with the ambient
-            # default (#136323); an endpoint no longer configured still heals to nothing. "auto"
-            # bills through the router with no attributable endpoint and stays filtered.
-            billing_base_url = str((session_meta or {}).get("billing_base_url") or "").strip()
-            if billing_base_url:
-                top_level.setdefault("base_url", billing_base_url)
-                top_level["provider"] = "custom"
-        if top_level:
-            return top_level
-        if not isinstance(runtime, dict):
-            return {}
-        return {k: v for k, v in runtime.items() if v is not None}
+
+        if config_model and session_model and config_model != session_model:
+            if billing_complete:
+                return {"provider": billing_provider, "base_url": billing_base_url}
+            # Billing incomplete: keep the legacy config-axis order below
+            # rather than guessing.
+
+        # Rule 2: legacy precedence inside the config axis.
+
+        top_level = {
+            key: raw.get(key)
+            for key in ("provider", "base_url", "api_mode")
+            if raw.get(key)
+        }
+        chosen = top_level
+        if not chosen and isinstance(runtime, dict):
+            # gateway_runtime without a provider still documents the route
+            # shape; keep its non-None entries instead of dropping them.
+            chosen = {k: v for k, v in runtime.items() if v is not None}
+
+        if chosen:
+            # Presence is not enough: the gateway_runtime passthrough above
+            # keeps empty strings (it only filters None), so a stored
+            # ``provider: ""`` would block the billing supplement and then be
+            # returned as the provider. Test the VALUE.
+            if not str(chosen.get("provider") or "").strip():
+                if billing_usable:
+                    # Rule 3: the config axis describes base_url/api_mode but
+                    # lost its provider; the billing provider is the only
+                    # durable identity left. Keeps sessions that never ran
+                    # /model on the provider that actually served them.
+                    chosen = dict(chosen)
+                    chosen["provider"] = billing_provider
+                elif bare_custom_with_endpoint:
+                    # Rule 3, bare-custom heal (#136323): the endpoint is the
+                    # only durable identity left; the config axis keeps its
+                    # own base_url when it has one.
+                    chosen = dict(chosen)
+                    chosen.setdefault("base_url", billing_base_url)
+                    chosen["provider"] = "custom"
+            return chosen
+
+        # Rule 4: nothing on the config axis. Bare billing buckets
+        # ("auto"/"custom") are not routable identities — filter them out so
+        # resume falls back to the ambient config default instead. The
+        # bare-custom pair is the exception: it feeds the readers' heal.
+        if billing_usable:
+            return {"provider": billing_provider}
+        if bare_custom_with_endpoint:
+            return {"provider": "custom", "base_url": billing_base_url}
+        return {}
 
     def register_backend_heartbeat(
         self, *, backend_id: str, pid: int, started_at: float, last_heartbeat: Optional[float] = None,

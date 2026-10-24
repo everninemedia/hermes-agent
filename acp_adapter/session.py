@@ -468,6 +468,8 @@ class SessionManager:
 
         meta = _parse_model_config(row.get("model_config"))
         cwd, model = meta.get("cwd", "."), row.get("model") or None
+        from hermes_state import SessionDB
+        runtime = SessionDB.session_gateway_runtime(row)
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
@@ -479,9 +481,9 @@ class SessionManager:
 
         try:
             agent = self._make_agent(
-                session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
-                requested_provider=meta.get("provider") or row.get("billing_provider"),
-                base_url=meta.get("base_url") or row.get("billing_base_url"))
+                session_id=session_id, cwd=cwd, model=model, api_mode=runtime.get("api_mode") or None,
+                requested_provider=runtime.get("provider") or None,
+                base_url=runtime.get("base_url") or None)
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None

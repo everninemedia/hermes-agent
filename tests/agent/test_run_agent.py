@@ -2637,6 +2637,9 @@ class TestHandleMaxIterations:
         # Plain what-now for the user; the raw exception stays in the log, not the reply.
         assert result.strip()
         assert "API down" not in result
+        assert "preserved the session state" in result
+        assert messages[-1]["role"] == "assistant"
+        assert messages[-1]["content"] == result
         complete_logical.assert_called_once()
         assert complete_logical.call_args.kwargs == {"outcome": "failed"}
 

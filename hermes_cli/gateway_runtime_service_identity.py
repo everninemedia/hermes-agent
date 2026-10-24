@@ -212,9 +212,48 @@ def verify_systemd(props: dict[str, str], manager_env: str, home: Path, *, syste
     verify_gateway_argv(argv, home)
 
 
+def _verify_launchd_jxa_argv(argv: list[str], home: Path) -> None:
+    """The installer's osascript/JXA hull for a profile home is accepted only as the complete
+    argv the installer emits for THIS home (launchd_program_arguments, #71206): this checkout's
+    own store launcher or installation-bound inline Python, the home's profile selector, the fixed stderr_timestamp wrapper with its
+    error log under ``<home>/logs``, the two log redirects under ``<home>/logs``, and ``gateway
+    run --external-supervisor``. The JavaScript/shell string is never parsed or searched: the
+    expected hull is rebuilt from the generator and compared whole, so any other launcher,
+    profile, log target, flag or extra shell/JavaScript code is unverified. Unknown homes have no
+    canonical envelope and are rejected rather than using a weaker decoder."""
+    from hermes_cli import gateway
+    from hermes_cli._launchers import runtime_command
+    from hermes_cli.gateway_launchd import launchd_program_arguments
+    from hermes_constants import profile_name_for_home
+
+    profile = profile_name_for_home(home)
+    if profile is None:
+        _unverified()
+    root = Path(gateway.PROJECT_ROOT).resolve()
+    launcher = str(root / ".hermes" / "bin" / "hermes")
+    args = [*([] if profile == "default" else ["--profile", profile]),
+            "gateway", "run", "--external-supervisor"]
+    logs = home.resolve() / "logs"
+    wrapper_args = ["--error-log", str(logs / "gateway.error.log"), "--"]
+    store_inner = [launcher, *args]
+    store = [launcher, "--run-module", "hermes_cli.stderr_timestamp", *wrapper_args, *store_inner]
+    # Rebuild from this install's selected interpreter, never from untrusted JXA inputs.
+    python = gateway.get_python_path()
+    inline_inner = runtime_command(root, args, python=python)
+    inline = runtime_command(root, [*wrapper_args, *inline_inner],
+                             module="hermes_cli.stderr_timestamp", python=python)
+    for command, inner in ((store, store_inner), (inline, inline_inner)):
+        if argv == launchd_program_arguments(command, logs / "gateway.log", logs / "gateway.error.log"):
+            verify_gateway_argv(inner, home, wrapped=True)
+            return
+    _unverified()
+
+
 def _verify_launchd_argv(argv: list[str], home: Path) -> None:
-    command, wrapped = _launchd_command(argv)
-    verify_gateway_argv(command, home, wrapped=wrapped)
+    if argv[:1] == ["/usr/bin/osascript"]:
+        _verify_launchd_jxa_argv(argv, home)
+        return
+    verify_gateway_argv(argv, home)
 
 
 def _launchd_command(argv: list[str]) -> tuple[list[str], bool]:
@@ -264,7 +303,8 @@ def verify_launchd_loaded(output: str, home: Path, *, uid: int, username: str) -
     verify_home(home, env.get("HERMES_HOME", ""))
     if home.parent.name != "profiles" and not env.get("HERMES_SUPERVISED_CHILD"):
         _unverified()
-    argv = [line.strip() for line in block("arguments")]
+    # launchctl contributes two indentation tabs; the rest is argv data, including whitespace.
+    argv = [line.removeprefix("\t\t") for line in block("arguments")]
     programs = re.findall(r"^\tprogram = (.+)$", output, re.MULTILINE)
     if len(programs) != 1 or not argv or programs[0] != argv[0]:
         _unverified()

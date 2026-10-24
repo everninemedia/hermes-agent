@@ -136,7 +136,7 @@ def test_loaded_launchd_identity_is_independent_of_disk(configured, command, rea
         verify_launchd_loaded(output, home, uid=123, username="owner")
 
 
-def _launchd_gateway_command(tmp_path, monkeypatch, *, store, profile=""):
+def _launchd_gateway_command(tmp_path, monkeypatch, *, store, profile="", logs=None):
     """The gateway command generate_launchd_plist persists, from a store Python or an external one."""
     from hermes_cli import _launchers, gateway as gw
     from hermes_cli.gateway_launchd import _timestamped_stderr_gateway_command
@@ -144,12 +144,20 @@ def _launchd_gateway_command(tmp_path, monkeypatch, *, store, profile=""):
     monkeypatch.setattr(gw, "get_python_path", lambda: sys.executable)
     monkeypatch.setattr(gw, "_profile_arg", lambda *a, **k: profile)
     monkeypatch.setattr(_launchers, "resolve_store_python", lambda *a, **k: Path(sys.executable) if store else None)
-    return _timestamped_stderr_gateway_command(tmp_path / "logs" / "gateway.error.log", external_supervisor=True)
+    return _timestamped_stderr_gateway_command((logs or tmp_path / "logs") / "gateway.error.log", external_supervisor=True)
+
+
+@pytest.mark.parametrize("store", [True, False])
+def test_unwrapped_installation_commands_still_verify(tmp_path, monkeypatch, store):
+    from hermes_cli.gateway_runtime_service_identity import verify_gateway_argv
+
+    command = _launchd_gateway_command(tmp_path, monkeypatch, store=store)
+    verify_gateway_argv(command, tmp_path / ".hermes")
 
 
 @pytest.mark.platforms("linux", "macos")  # launchd ProgramArguments are POSIX shell-quoted
 @pytest.mark.parametrize("case,reason", [
-    ("store", None), ("inline", None), ("store_profile", "profile_mismatch"),
+    ("store", None), ("inline", None), ("store_profile", "service_identity_unverified"),
     ("chained_shell", "service_identity_unverified"), ("substituted_shell", "service_identity_unverified"),
     ("extra_jxa", "service_identity_unverified"), ("foreign_osascript", "service_identity_unverified"),
     ("tampered_bootstrap", "service_identity_unverified"), ("arbitrary_inline", "service_identity_unverified"),
@@ -167,10 +175,12 @@ def test_launchd_verifies_the_osascript_wrapped_command_the_installer_writes(cas
     from hermes_cli.gateway_launchd import launchd_program_arguments
     from hermes_cli.gateway_runtime_service_identity import verify_launchd_loaded, verify_launchd_plist
     home = tmp_path / ".hermes"
+    # EVM binds both complete installer hulls to their canonical profile/logs.
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: home)
     from hermes_cli import gateway as gw
     command = _launchd_gateway_command(tmp_path, monkeypatch,
                                        store=case not in {"inline", "tampered_bootstrap", "foreign_root_inline"},
-                                       profile="--profile stranger" if case == "store_profile" else "")
+                                       profile="--profile stranger" if case == "store_profile" else "", logs=home / "logs")
     if case.startswith("foreign_root"):  # the installer's own output, written for another checkout
         from hermes_cli.gateway_launchd import _timestamped_stderr_gateway_command
         root = gw.PROJECT_ROOT
@@ -202,7 +212,7 @@ def test_launchd_verifies_the_osascript_wrapped_command_the_installer_writes(cas
         command = [sys.executable, "-I", "-c", "print('injected')", *command[3:]]
     if case == "other_run_module":
         command[2] = "other_module"
-    argv = launchd_program_arguments(command, tmp_path / "logs" / "gateway.log", tmp_path / "logs" / "gateway.error.log")
+    argv = launchd_program_arguments(command, home / "logs" / "gateway.log", home / "logs" / "gateway.error.log")
     shell_edits = {"chained_shell": (" >> ", "; id >> "), "substituted_shell": (" gateway run", " $(id) gateway run")}
     if case in shell_edits:
         edited = argv[4].replace(*shell_edits[case], 1)

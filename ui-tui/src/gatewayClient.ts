@@ -879,6 +879,7 @@ export class GatewayClient extends EventEmitter {
   }
 
   request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+    if (timeoutMs === undefined && method === 'session.compress') {timeoutMs = 660_000}
     const attachUrl = resolveGatewayAttachUrl()
 
     if (attachUrl) {

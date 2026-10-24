@@ -356,6 +356,61 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
+# Local patch fix-launchd-extra-env: the kanban-worker write guard HERMES_WRITE_SAFE_ROOT must live in the
+# gateway's launchd environment (workers inherit it; the profile .env would also hit desktop/CLI sessions).
+# The template has no hook for extra variables, so every start/install/setup rewrote the plist without it.
+# Allowlisted keys from <HERMES_HOME>/launchd-extra-env are appended after the template keys, and a
+# refresh that would drop one of them from the installed plist is refused before any write or bootout.
+_LAUNCHD_EXTRA_ENV_FILE = "launchd-extra-env"
+_LAUNCHD_EXTRA_ENV_ALLOWLIST = ("HERMES_WRITE_SAFE_ROOT",)
+
+
+def _launchd_extra_env() -> dict[str, str]:
+    """Allowlisted keys from <HERMES_HOME>/launchd-extra-env, in allowlist order. An unreadable file yields {}
+    so the refresh guard below refuses instead of the generator raising."""
+    path = _gw().get_hermes_home() / _LAUNCHD_EXTRA_ENV_FILE
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError) as exc:
+        _gw().logger.warning("launchd extra env %s unreadable: %s", path, exc)
+        return {}
+    found: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key in _LAUNCHD_EXTRA_ENV_ALLOWLIST and value:
+            found[key] = value
+    return {key: found[key] for key in _LAUNCHD_EXTRA_ENV_ALLOWLIST if key in found}
+
+
+def _launchd_extra_env_lost(plist_path: Path, new_plist: str) -> list[str]:
+    """Allowlisted keys set in the installed plist that the new definition would drop."""
+    import plistlib
+    try:
+        raw_installed = plist_path.read_bytes()
+    except OSError:
+        raw_installed = b""
+    try:
+        installed_env = plistlib.loads(raw_installed).get("EnvironmentVariables") or {}
+        installed_keys = {k for k in _LAUNCHD_EXTRA_ENV_ALLOWLIST if installed_env.get(k)}
+    except Exception:
+        # A damaged plist still counts as carrying a key whose name appears in it.
+        installed_keys = {k for k in _LAUNCHD_EXTRA_ENV_ALLOWLIST if k.encode() in raw_installed}
+    try:
+        new_env = plistlib.loads(new_plist.encode("utf-8")).get("EnvironmentVariables") or {}
+    except Exception:
+        new_env = {}  # unparseable new definition counts as dropping every protected key
+    return [k for k in _LAUNCHD_EXTRA_ENV_ALLOWLIST if k in installed_keys and not new_env.get(k)]
+
+
 def generate_launchd_plist() -> str:
     from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
@@ -370,6 +425,11 @@ def generate_launchd_plist() -> str:
     priority_dirs = _gw()._build_service_path_dirs()
     _gw()._append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
+
+    extra_env_xml = "".join(
+        f"\n        <key>{key}</key>\n        <string>{escape(value)}</string>"
+        for key, value in _launchd_extra_env().items()
+    )
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
@@ -419,7 +479,7 @@ def generate_launchd_plist() -> str:
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
         <key>HERMES_SUPERVISED_CHILD</key>
-        <string>1</string>
+        <string>1</string>{extra_env_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -555,6 +615,13 @@ def refresh_launchd_plist_if_needed() -> bool:
         return False
 
     new_plist = _gw().generate_launchd_plist()
+    lost = _launchd_extra_env_lost(plist_path, new_plist)
+    if lost:
+        print(
+            f"✗ Refusing to rewrite {plist_path}: the new definition would drop {', '.join(lost)}. "
+            f"Put the value into {_gw().get_hermes_home() / _LAUNCHD_EXTRA_ENV_FILE} first."
+        )
+        return False
     if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
         return False
 
@@ -645,6 +712,13 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
 
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = _gw().generate_launchd_plist()
+    lost = _launchd_extra_env_lost(plist_path, new_plist) if plist_path.exists() else []
+    if lost:
+        print(
+            f"✗ Refusing to reinstall {plist_path}: the new definition would drop {', '.join(lost)}. "
+            f"Put the value into {_gw().get_hermes_home() / _LAUNCHD_EXTRA_ENV_FILE} first."
+        )
+        return
     if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
         return
     print(f"Installing launchd service to: {plist_path}")

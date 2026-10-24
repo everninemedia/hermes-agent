@@ -51,10 +51,14 @@ it('keeps edit counts without code in either display mode and restores disclosur
       </ThreadRuntime>
     )
 
-    await waitFor(() => expect(container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull())
+    // Local fold policy: transcript references mount folded, so open this
+    // concrete disclosure explicitly before the visibility checks below.
+    await waitFor(() => expect(container.querySelector('[data-tool-row] button[aria-expanded]')).not.toBeNull())
     const row = container.querySelector('[data-tool-row]')!
     // An explicitly open historical row must not override the preference.
     const toggle = row.querySelector('button[aria-expanded]')!
+    fireEvent.click(toggle)
+    await waitFor(() => expect(container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull())
     fireEvent.click(toggle)
     fireEvent.click(toggle)
 

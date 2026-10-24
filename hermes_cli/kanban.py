@@ -422,7 +422,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         assignee = _profile_author()
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
-        kb.recompute_ready(conn)
+        from agent.delegation_context import kanban_path_is_fenced
+        if not kanban_path_is_fenced(kb.kanban_db_path()):
+            kb.recompute_ready(conn)
         tasks = kb.list_tasks(
             conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
             include_archived=args.archived, order_by=getattr(args, "sort", None),

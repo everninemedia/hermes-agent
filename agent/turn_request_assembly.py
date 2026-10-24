@@ -107,6 +107,7 @@ def assemble_api_request(
     agent: Any, *, messages: Any, current_turn_user_idx: Any, _ext_prefetch_cache: Any,
     _plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
     original_user_message: Any, pending_moa_prepared_request: Any, request_logger: Any,
+    api_call_count: int = 0,
 ) -> AssembledRequest:
     """Assemble the request in the original order. ORDER IS LOAD-BEARING: cache breakpoints
     are injected only after whitespace normalization, the orphan sweep, thinking-only drop /
@@ -125,6 +126,13 @@ def assemble_api_request(
         ext_prefetch_cache=_ext_prefetch_cache, plugin_user_context=_plugin_user_context,
         moa_config=moa_config, active_system_prompt=active_system_prompt,
     )
+
+    # ``getattr``: assembly is also exercised with minimal agent stubs that model no
+    # iteration budget; without a budget there is nothing to nudge against.
+    max_iterations = getattr(agent, "max_iterations", 0)
+    should_nudge, remaining = _iteration_closeout_policy(api_call_count, max_iterations)
+    if should_nudge:
+        _append_iteration_closeout_nudge(api_messages, remaining_after_call=remaining)
 
     if moa_config:
         _append_moa_context(agent, api_messages, moa_config, original_user_message)
@@ -284,3 +292,47 @@ def assemble_api_request(
         "fallthrough", api_messages, tools_for_api, _moa_prepared_request,
         pending_moa_prepared_request, approx_tokens, request_pressure_tokens, approx_tokens * 4,
     )
+
+
+# Keep enough room to stop exploring and close the turn before the hard cap.
+# The nudge is request-local (not persisted). Tools remain registered because
+# strict providers may reject replayed tool_use/tool_result history when the
+# matching definitions disappear. Responses and Anthropic summaries strip routing
+# at their own chokepoint; Chat Completions retains its cached tool definitions.
+_ITERATION_CLOSEOUT_NUDGE_AFTER_CALLS = 6
+
+
+def _iteration_closeout_policy(api_call_count: int, max_iterations: int) -> tuple[bool, int]:
+    remaining_after_call = max(0, int(max_iterations) - int(api_call_count))
+    if int(max_iterations) <= _ITERATION_CLOSEOUT_NUDGE_AFTER_CALLS * 2:
+        return False, remaining_after_call
+    return remaining_after_call <= _ITERATION_CLOSEOUT_NUDGE_AFTER_CALLS, remaining_after_call
+
+
+def _append_iteration_closeout_nudge(
+    api_messages: list[dict], *, remaining_after_call: int
+) -> None:
+    nudge = (
+        "[Hermes iteration-budget closeout]\n"
+        f"Only {remaining_after_call} provider calls remain after this one. "
+        "Stop new exploration. Use only the minimum remaining tool calls needed "
+        "to make the current state safe, then return the best honest final text "
+        "with completed work, concrete paths/commits, and open items before the cap."
+    )
+    if (
+        api_messages
+        and api_messages[-1].get("role") == "user"
+        and isinstance(api_messages[-1].get("content"), str)
+    ):
+        api_messages[-1] = dict(api_messages[-1])
+        api_messages[-1]["content"] = api_messages[-1]["content"].rstrip() + "\n\n" + nudge
+    elif api_messages and api_messages[-1].get("role") == "tool":
+        tail = dict(api_messages[-1])
+        content = tail.get("content")
+        if isinstance(content, str):
+            tail["content"] = content + "\n\n" + nudge
+        elif isinstance(content, list) or content is None:
+            tail["content"] = [*(content or []), {"type": "text", "text": nudge}]
+        else:
+            return
+        api_messages[-1] = tail
