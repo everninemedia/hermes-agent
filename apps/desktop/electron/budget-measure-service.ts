@@ -58,6 +58,10 @@ export type BudgetMeasureServiceDeps = {
   hashSettleMs?: number
   grokBotGraceMs?: number
   chmodSocket?: (path: string, mode: number) => void
+  // Electron net.isOnline(). Without network the run opens no window and
+  // starts no navigation (Hermes crashes on 26.10. and 29.10.2026 fell into
+  // budget runs during network loss).
+  isOnline?: () => boolean
 }
 
 export type BudgetMeasureProviderResult = {
@@ -328,6 +332,14 @@ function readJsonBody(req: IncomingMessage, maxBytes = 32_768): Promise<Record<s
     })
     req.on('error', reject)
   })
+}
+
+// Leave the current Chromium event dispatch before touching the WebContents
+// again. Promise continuations of loadURL and the window listeners run inside
+// the WebContentsObserver notification; navigating or destroying there is
+// what Chromium guards with CHECKs.
+function nextTask(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve))
 }
 
 function timeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -656,15 +668,32 @@ export class BudgetMeasureService {
     json(res, 200, entry.run)
   }
 
+  private isOffline(): boolean {
+    try { return this.deps.isOnline ? !this.deps.isOnline() : false } catch { return false }
+  }
+
   private async runMeasurement(run: BudgetMeasureRun, providers: ProviderId[], signal: AbortSignal) {
     const deadline = Date.now() + RUN_TIMEOUT_MS
 
     try {
+      if (this.isOffline()) {
+        for (const provider of providers) {run.providers[provider] = this.failure('timeout', 'Kein Netz, Messung übersprungen')}
+        this.deps.logger?.('[budget] Kein Netz, D1-Lauf übersprungen')
+
+        return
+      }
+
       const window = await this.ensureMeasurementWindow()
 
       for (const provider of providers) {
         if (signal.aborted || Date.now() >= deadline) {
           run.providers[provider] = this.failure('desktop_down', 'D1-Laufzeitlimit erreicht')
+
+          continue
+        }
+
+        if (this.isOffline()) {
+          run.providers[provider] = this.failure('timeout', 'Kein Netz, Messung übersprungen')
 
           continue
         }
@@ -722,12 +751,19 @@ export class BudgetMeasureService {
     if (!window || window.isDestroyed()) {return}
 
     try {
+      await nextTask()
+
+      if (window.isDestroyed()) {return}
       await timeout(window.loadURL('about:blank', { timeout: 5000 }), 5000, 'park_timeout')
     } catch {
+      await nextTask()
+
       if (this.measureEpoch === epoch && !this.busy) {this.destroyMeasurementWindow()}
 
       return
     }
+
+    await nextTask()
 
     if (this.measureEpoch !== epoch || this.busy) {return}
     // Do not keep the window alive between runs. macOS pulls the parked window back on screen,
@@ -785,7 +821,9 @@ export class BudgetMeasureService {
 
     this.rendererGoneHandler = (_event: any, details: any) => {
       this.deps.logger?.(`[budget] Renderer-Crash im Messfenster (${String(details?.reason || 'unbekannt')})`)
-      this.destroyMeasurementWindow()
+      setImmediate(() => {
+        if (this.measurementWindow === window) {this.destroyMeasurementWindow()}
+      })
     }
 
     window.webContents.on?.('render-process-gone', this.rendererGoneHandler)
@@ -805,7 +843,9 @@ export class BudgetMeasureService {
     partitionSession.on('will-download', this.downloadHandler)
 
     this.closedHandler = () => {
-      if (this.measurementWindow === window) {this.destroyMeasurementWindow()}
+      setImmediate(() => {
+        if (this.measurementWindow === window) {this.destroyMeasurementWindow()}
+      })
     }
 
     window.on('closed', this.closedHandler)
@@ -857,9 +897,15 @@ export class BudgetMeasureService {
     // URL mit statischem #settings/usage (kein hashchange). Erst claude.ai/new,
     // dann Hash leeren und neu setzen. Gleicher Tanz wie scrape-budgets.mjs.
     await timeout(window.loadURL(spec.warmup, { timeout: NAVIGATION_TIMEOUT_MS }), navMs, 'navigation_timeout')
-    await window.webContents.executeJavaScript('location.hash = ""; void 0')
+    await nextTask()
+    await this.runPageScript(window, 'location.hash = ""; void 0')
     await sleep(this.hashSettleMs)
-    await window.webContents.executeJavaScript('location.hash = "#settings/usage"; void 0')
+    await this.runPageScript(window, 'location.hash = "#settings/usage"; void 0')
+  }
+
+  private async runPageScript(window: WindowLike, code: string): Promise<void> {
+    if (window.isDestroyed() || window.webContents.isDestroyed?.()) {throw new Error('window_destroyed')}
+    await timeout(window.webContents.executeJavaScript(code), 5000, 'navigation_timeout')
   }
 
   private async measureProvider(window: WindowLike, provider: ProviderId, signal: AbortSignal, limitMs: number): Promise<BudgetMeasureProviderResult> {
@@ -868,6 +914,8 @@ export class BudgetMeasureService {
     try {
       await this.openProviderUsage(window, provider, deadline)
     } catch (error: any) {
+      await nextTask()
+
       return this.navigationFailure(window, signal, error)
     }
 
@@ -875,7 +923,7 @@ export class BudgetMeasureService {
   }
 
   private navigationFailure(window: WindowLike, signal: AbortSignal, error: any): BudgetMeasureProviderResult {
-    try { window.webContents.stop?.() } catch { /* stop is best effort after navigation failure */ }
+    try { if (!window.isDestroyed()) {window.webContents.stop?.()} } catch { /* stop is best effort after navigation failure */ }
 
     if (signal.aborted) {return this.failure('desktop_down', 'Messung abgebrochen')}
 

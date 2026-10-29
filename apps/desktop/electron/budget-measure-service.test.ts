@@ -611,3 +611,80 @@ test('grok: a late-rendering Grok Bot card is waited for and captured (28.09.202
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('D1 run without network opens no window and reports timeout per provider', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-test-'))
+  const session = new FakeSession()
+  let online = false
+  let windowsOpened = 0
+
+  class CountingWindow extends FakeWindow {
+    constructor(options: any) {
+      super(options)
+      windowsOpened += 1
+    }
+  }
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: CountingWindow as any,
+    hashSettleMs: 0,
+    grokBotGraceMs: 0,
+    fromPartition: () => session,
+    isOnline: () => online
+  })
+
+  try {
+    await service.start()
+    const { socketPath, tokenPath } = service.getPaths()
+    const token = readFileSync(tokenPath, 'utf8').trim()
+    const accepted = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai', 'claude'] })
+    const result = await waitForComplete(socketPath, token, accepted.body.run_id)
+
+    assert.equal(windowsOpened, 0)
+    assert.equal(result.providers.zai.status, 'timeout')
+    assert.match(result.providers.zai.detail, /Kein Netz/)
+    assert.equal(result.providers.claude.status, 'timeout')
+
+    online = true
+    const again = await rpc(socketPath, token, 'POST', '/measure', { providers: ['zai'] })
+    const second = await waitForComplete(socketPath, token, again.body.run_id)
+    assert.equal(windowsOpened, 1)
+    assert.equal(second.providers.zai.status, 'ok')
+  } finally {
+    await service.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('renderer crash tears the measurement window down outside the Chromium event', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-test-'))
+  const session = new FakeSession()
+  const handlers = new Map<string, (...args: any[]) => void>()
+
+  class ListeningWindow extends FakeWindow {
+    constructor(options: any) {
+      super(options)
+      this.webContents.on = (event: string, listener: (...args: any[]) => void) => { handlers.set(event, listener) }
+    }
+  }
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: ListeningWindow as any,
+    hashSettleMs: 0,
+    grokBotGraceMs: 0,
+    fromPartition: () => session
+  })
+
+  try {
+    const window = await (service as any).ensureMeasurementWindow()
+    handlers.get('render-process-gone')?.({}, { reason: 'crashed' })
+    assert.equal(window.isDestroyed(), false, 'destroy must not run inside the render-process-gone dispatch')
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(window.isDestroyed(), true)
+  } finally {
+    await service.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})

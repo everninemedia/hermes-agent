@@ -17966,6 +17966,7 @@ app.whenReady().then(() => {
     appDataPath: app.getPath('userData'),
     BrowserWindow,
     fromPartition: partition => session.fromPartition(partition),
+    isOnline: () => electronNet.isOnline(),
     logger: message => rememberLog(message)
   })
   void budgetMeasureService.start().catch(error => {
