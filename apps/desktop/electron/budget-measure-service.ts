@@ -145,10 +145,13 @@ const PROVIDER_CONFIG: Record<ProviderId, { url: string; warmup: string; marker:
     warmup: 'https://claude.ai/new',
     marker: /(?:all\s+models|alle\s+modelle|diese\s+woche|this\s+week|w(?:ö|oe)chentlichen\s+limits|weekly\s+limit)/i,
   },
+  // 30.10.2026: ChatGPT leitet die alte Codex-Analytics-URL auf
+  // /settings/usage?tab=analytics um; dort steht nur noch der Verlauf. Der
+  // Wochenwert ("Wöchentliches Limit … 67 % übrig") lebt im Tab "Übersicht".
   codex: {
-    url: 'https://chatgpt.com/codex/cloud/settings/analytics#usage',
+    url: 'https://chatgpt.com/settings/usage?tab=overview',
     warmup: 'https://chatgpt.com/',
-    marker: /(?:weekly\s+usage\s+limit|wöchentliches\s+nutzungslimit)/i
+    marker: /(?:weekly\s+(?:usage\s+)?limit|w(?:ö|oe)chentliches\s+(?:nutzungs)?limit)/i
   }
 }
 
@@ -191,7 +194,11 @@ const PROVIDER_EXTRACT_JS: Record<ProviderId, string> = {
       })
       if (badgeEl) { badge = String(badgeEl.textContent || '').trim().toUpperCase() }
     }
-    return { planBadge: badge }
+    // Exakter Wochen-Reset steht nur im title-Attribut der relativen Anzeige
+    // ("Bis zum Zurücksetzen: 5 Tg., 20 Std." -> "Donnerstag, 5. November 2026 um 11:36:20 MEZ").
+    const resetEl = Array.from(document.querySelectorAll('[title]')).find(el => !el.children.length && /zur(?:ü|ue)cksetzen|resets?/i.test(String(el.textContent || '')))
+    const weekResetTitle = resetEl ? String(resetEl.getAttribute('title') || '').trim().slice(0, 120) : ''
+    return { planBadge: badge, weekResetTitle }
   })()`,
   grok: `(() => {
     const heading = Array.from(document.querySelectorAll('h1,h2,h3,h4')).find(el => /SuperGrok.*-?Limit/i.test((el.textContent || '').trim()))
@@ -729,6 +736,9 @@ export class BudgetMeasureService {
 
     const patterns = [
       /w(?:ö|oe)chentliches nutzungslimit[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}verbleibend/i,
+      // Codex-Übersicht seit 30.10.2026: ohne Tarif-Badge, nur angemeldet sichtbar.
+      /w(?:ö|oe)chentliches limit[\s\S]{0,80}\d{1,3}\s*%\s*übrig/i,
+      /weekly limit[\s\S]{0,80}\d{1,3}\s*%\s*(?:left|remaining)/i,
       /supergrok[\s\S]{0,60}?limit[\s\S]{0,40}(?:gebraucht|used)/i,
       /w(?:ö|oe)chentliche quote[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}gebraucht/i,
       /all models?[\s\S]{0,40}\d{1,3}\s*%[\s\S]{0,40}used/i,
@@ -1078,6 +1088,8 @@ export class BudgetMeasureService {
     if (provider === 'claude' && extracted.accountMarker) {appendixParts.push(`[DOM Nutzer-Knopf: ${compactText(extracted.accountMarker, 80)}]`)}
 
     if (provider === 'codex' && extracted.planBadge) {appendixParts.push(`[DOM Profil-Badge: ${compactText(extracted.planBadge, 20)}]`)}
+
+    if (provider === 'codex' && extracted.weekResetTitle) {appendixParts.push(`[DOM Wochen-Reset: ${compactText(extracted.weekResetTitle, 120)}]`)}
 
     if (provider === 'grok') {grokDom = this.grokEvidence(extracted, appendixParts)}
 

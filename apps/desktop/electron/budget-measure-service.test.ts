@@ -21,6 +21,9 @@ class FakeWindow extends EventEmitter {
   static missingEvidence = false
   static ignoreStaticClaudeHash = false
   static claudeUsageText = ''
+  // Codex-Übersicht seit 30.10.2026: Seitentext und DOM-Antwort überschreibbar.
+  static codexUsageText = ''
+  static codexDom: any = null
   // Grok Bot: zweite Karte "Weekly Grok Bot Limit" auf grok.com (seit 14.09.2026).
   // null = Seite zeigt nur die SuperGrok-Karte (Stand bis 13.09.2026).
   static grokBot: { aria: string | null; text: string; cardHead: string } | null = null
@@ -35,7 +38,7 @@ class FakeWindow extends EventEmitter {
   static readonly domResponses: Array<{ marker: string; respond: () => any }> = [
     { marker: 'accountAvatar', respond: () => ({ accountAvatar: 'T' }) },
     { marker: 'accountMarker', respond: () => ({ accountMarker: 'Tobi' }) },
-    { marker: 'planBadge', respond: () => ({ planBadge: 'PRO' }) },
+    { marker: 'planBadge', respond: () => FakeWindow.codexDom || ({ planBadge: 'PRO' }) },
     {
       marker: 'handle',
       respond: () => ({
@@ -93,7 +96,7 @@ class FakeWindow extends EventEmitter {
         ? `Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück ${FakeWindow.grokBot.cardHead} ${FakeWindow.grokBot.text}`
         : 'Nutzung Wöchentliches SuperGrok Heavy-Limit gebraucht Grok Build 53% Setzt 27. August 2026 um 18:04 zurück',
       'https://claude.ai/new#settings/usage': FakeWindow.claudeUsageText || 'Nutzung Alle Modelle Zurücksetzung Sa., 14:59 31 % verwendet',
-      'https://chatgpt.com/codex/cloud/settings/analytics#usage': 'Weekly usage limit 91% remaining Resets Aug 31, 2026 9:02 AM'
+      'https://chatgpt.com/settings/usage?tab=overview': FakeWindow.codexUsageText || 'Weekly usage limit 91% remaining Resets Aug 31, 2026 9:02 AM'
     }
     let text = states[this.currentUrl] || ''
 
@@ -430,6 +433,40 @@ test('accepts Claude Diese-Woche usage card without Alle Modelle', async () => {
   } finally {
     FakeWindow.ignoreStaticClaudeHash = false
     FakeWindow.claudeUsageText = ''
+    await service.stop()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('codex: overview tab without plan badge is accepted via the plan-limits card and carries the exact reset (30.10.2026)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hermes-budget-codex-overview-'))
+  const session = new FakeSession()
+  FakeWindow.codexUsageText = 'Nutzung Übersicht Analysen Planlimits Wöchentliches Limit Bis zum Zurücksetzen: 5 Tg., 20 Std. 67 % übrig Aktuelle Nutzung des Plankontingents'
+  FakeWindow.codexDom = { planBadge: '', weekResetTitle: 'Donnerstag, 5. November 2026 um 11:36:20 MEZ' }
+
+  const service = new BudgetMeasureService({
+    appDataPath: root,
+    BrowserWindow: FakeWindow as any,
+    hashSettleMs: 0,
+    grokBotGraceMs: 0,
+    fromPartition: () => session,
+    now: () => new Date('2026-10-30T13:45:00.000Z')
+  })
+
+  try {
+    await service.start()
+    const { socketPath, tokenPath } = service.getPaths()
+    const token = readFileSync(tokenPath, 'utf8').trim()
+    const accepted = await rpc(socketPath, token, 'POST', '/measure', { providers: ['codex'] })
+    const result = await waitForComplete(socketPath, token, accepted.body.run_id)
+
+    assert.equal(result.providers.codex.status, 'ok')
+    assert.match(result.providers.codex.quote, /67 % übrig/)
+    assert.match(result.providers.codex.dom_appendix, /\[DOM Wochen-Reset: Donnerstag, 5\. November 2026 um 11:36:20 MEZ\]/)
+    assert.doesNotMatch(result.providers.codex.dom_appendix, /Profil-Badge/)
+  } finally {
+    FakeWindow.codexUsageText = ''
+    FakeWindow.codexDom = null
     await service.stop()
     await rm(root, { recursive: true, force: true })
   }
