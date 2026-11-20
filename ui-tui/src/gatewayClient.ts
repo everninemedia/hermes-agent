@@ -10,6 +10,9 @@ import { bootstrapLocalGateway, isTerminalBootstrapFailure } from './localGatewa
 
 const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
 const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
+/** Manual compression can outlast the RPC default; matches the desktop's SESSION_COMPRESS_TIMEOUT_MS,
+ *  above the compute host's 630s wait cap (tui_gateway/compute_host_bridge.py). */
+const SESSION_COMPRESS_TIMEOUT_MS = 660_000
 
 const envUrl = (name: 'HERMES_TUI_GATEWAY_URL' | 'HERMES_TUI_SIDECAR_URL') => () => process.env[name]?.trim() || null
 
@@ -28,5 +31,13 @@ export class GatewayClient extends SharedGatewayClient {
       text: t,
       toolProgress: () => launchToolProgress()
     })
+  }
+
+  override request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+    return super.request<T>(
+      method,
+      params,
+      timeoutMs ?? (method === 'session.compress' ? SESSION_COMPRESS_TIMEOUT_MS : undefined)
+    )
   }
 }
