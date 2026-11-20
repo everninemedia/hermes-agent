@@ -1255,7 +1255,7 @@ class TestGitDestructiveOps:
 
 
     def test_safe_git_ops_not_flagged(self):
-        for cmd in ("git status", "git push origin main"):
+        for cmd in ("git status", "git fetch origin main"):
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 

@@ -491,6 +491,29 @@ _PS_EXE_AT_COMMAND_POSITION = (
 
 # An argument may open with a quote the shell strips (`"-f"`, `'+main'`, `"--force"`).
 _GIT_PUSH_ARG_START = r'''\s["']?'''
+# Local policy: a plain push or merge is intentional work on shared history, but stays a human-confirmed
+# action in interactive sessions. `merge-base`, `merge-file`, `merge-tree`, `mergetool` are other subcommands.
+_GIT_PUSH_DESCRIPTION = "git push (publishes commits to a remote)"
+_GIT_MERGE_DESCRIPTION = "git merge (changes the current branch)"
+_GIT_PLAIN_PUSH = rf'{_GIT}push(?![\w-])'
+_GIT_MERGE = rf'{_GIT}merge(?![\w-])'
+
+
+class _GitInvocationMatcher:
+    """`git push` / `git merge` as a real INVOCATION. The listed `_GIT` rule finds a candidate from each
+    `git` word (linear, like the other git rules); only then is the _CMDPOS-anchored form tried, so a
+    read of that text (`grep 'git push' notes.md`, `git commit -m 'git push later'`) is data, and a long
+    `$(` run without a candidate is not rescanned from every `$(`."""
+
+    def __init__(self, pattern: str):
+        self.pattern = pattern
+        self._candidate = re.compile(pattern, _RE_FLAGS)
+        self._invocation = re.compile(_CMDPOS + pattern, _RE_FLAGS)
+
+    def search(self, text: str):
+        return self._invocation.search(text) if self._candidate.search(text) else None
+
+
 _DEV_TCP_REDIRECT_DESCRIPTION = "reverse shell via /dev/tcp or /dev/udp redirect"
 # PowerShell verbs/aliases that write a registry key when given a provider path.
 _REG_WRITE_VERB = r'(?:sp|si|ni|set-item|new-item|md|mkdir)'
@@ -817,6 +840,11 @@ DANGEROUS_PATTERNS = [
     # whole blank run sits between the option and its value (`-o  +foo`).
     (rf'{_GIT_PUSH}{_GIT_PUSH_ARGS}(?<!\s)(?<!\s-o)(?<!\s--push-option)\s+["\']?\+[^\s;&|\n]+',
      "git force push (rewrites remote history)"),
+    # Local policy: a plain push or merge asks too, at a command position only (_GitInvocationMatcher).
+    # Listed after the force-push rules so their more specific explanation wins; across detection
+    # variants _iter_dangerous_descriptions holds the plain push back for the same reason.
+    (_GIT_PLAIN_PUSH, _GIT_PUSH_DESCRIPTION),
+    (_GIT_MERGE, _GIT_MERGE_DESCRIPTION),
     # `hermes config set` can rewrite the agent's own approval policy (approvals.mode, approvals.deny,
     # command_allowlist) — gate it like the file-tool path so a default empty deny list is not an open door.
     # Anchored to a real INVOCATION: the command must BE `hermes config set <policy key>`. The
@@ -868,6 +896,8 @@ _CUSTOM_MATCHERS = {
     _WMIC_SHADOW_DELETE_DESCRIPTION: WmicShadowDeleteMatcher,
     _DEV_TCP_REDIRECT_DESCRIPTION: _DevSocketRedirectMatcher,
     _DOWNLOAD_THEN_RUN_DESCRIPTION: lambda: DownloadThenRunMatcher(_SHELL_NAMES_RE),
+    _GIT_PUSH_DESCRIPTION: lambda: _GitInvocationMatcher(_GIT_PLAIN_PUSH),
+    _GIT_MERGE_DESCRIPTION: lambda: _GitInvocationMatcher(_GIT_MERGE),
 }
 DANGEROUS_PATTERNS_COMPILED = [
     (_CUSTOM_MATCHERS[d]() if d in _CUSTOM_MATCHERS else re.compile(p, _RE_FLAGS), d)
@@ -1860,6 +1890,7 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
         (pattern_re, description) for pattern_re, description in DANGEROUS_PATTERNS_COMPILED if description in only
     ]
     capped: list[str] = []
+    plain_push = False
     for command_variant in _command_detection_variants(command, capped=capped):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
@@ -1880,7 +1911,13 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
                 if any(_upload_flag_owned_by_curl_or_wget(owner_ranges, match.start()) for match in matches):
                     yield description
             elif pattern_re.search(command_lower):
-                yield description
+                if description == _GIT_PUSH_DESCRIPTION:
+                    # Held back: only a later variant shows some force pushes (`git push -o ci\;skip -f`).
+                    plain_push = True
+                else:
+                    yield description
+    if plain_push:
+        yield _GIT_PUSH_DESCRIPTION
     if capped and only is None:
         yield _PARSER_LIMIT_DESCRIPTION
     if only is not None:

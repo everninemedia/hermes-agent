@@ -7,11 +7,16 @@ git's combined short flags (``-qf``), the ``+refspec`` spelling, and a push behi
 global options (``git -C <dir> push -f``).
 
 The pre-change approval keys of all git rules are pinned in ``test_approval_git_global_options.py``.
+
+Local policy (``test_git_publish_approval.py``): a plain ``git push`` asks for approval under its
+own key, so "not a force push" is asserted here as exactly that key, never a force-push one.
 """
 
 import pytest
 
 from tools.approval import detect_dangerous_command
+
+PLAIN_PUSH = "git push (publishes commits to a remote)"
 
 
 class TestGitForcePushDetected:
@@ -94,8 +99,8 @@ class TestGitForcePushDetected:
         "git push -o  +foo origin main",
         "git push --push-option \t+foo origin main",
     ])
-    def test_an_ordinary_push_stays_unprompted(self, command):
-        assert detect_dangerous_command(command) == (False, None, None)
+    def test_an_ordinary_push_is_never_a_force_push(self, command):
+        assert detect_dangerous_command(command) == (True, PLAIN_PUSH, PLAIN_PUSH)
 
 
 class TestGitForcePushScope:
@@ -113,8 +118,8 @@ class TestGitForcePushScope:
         "git push -o a\\;b origin main && grep -f patterns.txt",
     ])
     def test_a_later_command_flag_is_not_a_force_push(self, command):
-        dangerous, _key, description = detect_dangerous_command(command)
-        assert dangerous is False, f"{command!r} -> {description!r}"
+        _dangerous, _key, description = detect_dangerous_command(command)
+        assert description == PLAIN_PUSH, f"{command!r} -> {description!r}"
 
 
 @pytest.mark.parametrize("unit", [">&", "&>", ">|", "'a' ", '"a" ', "'", '"', "\\", "-c "])
@@ -123,5 +128,5 @@ def test_a_run_inside_the_push_segment_does_not_backtrack_exponentially(unit):
     import time
 
     start = time.monotonic()
-    assert detect_dangerous_command("git push origin main " + unit * 200) == (False, None, None)
+    assert detect_dangerous_command("git push origin main " + unit * 200) == (True, PLAIN_PUSH, PLAIN_PUSH)
     assert time.monotonic() - start < 2

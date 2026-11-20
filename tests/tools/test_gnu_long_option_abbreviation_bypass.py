@@ -53,7 +53,8 @@ class TestGitPushForceLongOptionAbbreviation:
         assert dangerous is True
 
     def test_git_push_set_upstream_not_flagged(self):
-        dangerous, _, _ = detect_dangerous_command(
+        """Not flagged as a FORCE push; local policy gates it as a plain push."""
+        _, _, desc = detect_dangerous_command(
             "git push --set-upstream origin feature"
         )
-        assert dangerous is False
+        assert desc == "git push (publishes commits to a remote)"

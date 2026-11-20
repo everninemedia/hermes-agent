@@ -55,24 +55,34 @@ def test_flagged(cmd):
     "cmd",
     [
         "git -C /tmp/x status",
-        "git -C /tmp/x push origin main",
         "git -C /tmp/x branch -d feature",
         "git -C /tmp/x reset --soft HEAD~1",
         "git --no-pager log push --force",
         "git status && echo push --force",
         'git -C "/tmp/g space" status',
-        "git -C my\\ repo push origin main",
-        "git -C $(git rev-parse --show-toplevel) push origin main",
-        "git -C $(realpath $(pwd)) push origin main",
         "git --no-pager log --oneline push --force",
         # A value-less option, or an unknown one with no option after its word, takes no value.
         "git -P log --oneline push --force",
         "git -q log push --force",
-        "git -C $(dirname $(realpath $(pwd))) push origin main",
     ],
 )
 def test_not_flagged(cmd):
     assert not detect_dangerous_command(cmd)[0], cmd
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git -C /tmp/x push origin main",
+        "git -C my\\ repo push origin main",
+        "git -C $(git rev-parse --show-toplevel) push origin main",
+        "git -C $(realpath $(pwd)) push origin main",
+        "git -C $(dirname $(realpath $(pwd))) push origin main",
+    ],
+)
+def test_a_plain_push_behind_global_options_is_not_a_force_push(cmd):
+    """Local policy gates the plain push under its own key (``test_git_publish_approval.py``)."""
+    assert detect_dangerous_command(cmd)[1] == "git push (publishes commits to a remote)", cmd
 
 
 @pytest.mark.parametrize(
@@ -140,11 +150,16 @@ def test_an_unclosed_nested_substitution_is_scanned_linearly(value):
     assert time.monotonic() - start < 2
 
 
-@pytest.mark.parametrize("prefix, unit", [("", "git -c "), ("", "git push "), ("git push ", "-c git ")])
-def test_a_repeated_git_word_does_not_rescan_the_rest(prefix, unit):
+@pytest.mark.parametrize("prefix, unit, key", [
+    ("", "git -c ", None),
+    # Local policy: the leading plain push asks under its own key, never a force-push one.
+    ("", "git push ", "git push (publishes commits to a remote)"),
+    ("git push ", "-c git ", "git push (publishes commits to a remote)"),
+])
+def test_a_repeated_git_word_does_not_rescan_the_rest(prefix, unit, key):
     """Each `git` word starts a new search; an uncapped option run or push scan made this quadratic."""
     import time
 
     start = time.monotonic()
-    assert not detect_dangerous_command(prefix + unit * 3000 + "x;")[0]
+    assert detect_dangerous_command(prefix + unit * 3000 + "x;")[1] == key
     assert time.monotonic() - start < 2
