@@ -414,6 +414,52 @@ describe('a file edit among ordinary activity', () => {
   })
 })
 
+describe('folded file references', () => {
+  it('keeps a lone file read folded until its row is opened', async () => {
+    const { container } = render(<GroupHarness message={completedOnlyMessage()} />)
+    const rowToggle = await waitFor(() => {
+      const toggle = container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+      expect(toggle).not.toBeNull()
+      return toggle as Element
+    })
+    expect(screen.queryByText('127.0.0.1 localhost')).toBeNull()
+    fireEvent.click(rowToggle)
+    expect(await screen.findByText('127.0.0.1 localhost')).toBeTruthy()
+  })
+
+  it('keeps the diff card visible but its body folded until opened', async () => {
+    const { container } = render(<GroupHarness message={editBetweenRunsMessage()} />)
+    const rowToggle = await waitFor(() => {
+      const toggle = container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+      expect(toggle).not.toBeNull()
+      return toggle as Element
+    })
+    expect(container.querySelector('[data-tool-row][data-tool-open]')).toBeNull()
+    expect(screen.queryByText('added line')).toBeNull()
+    fireEvent.click(rowToggle)
+    expect(await screen.findByText('added line')).toBeTruthy()
+  })
+  for (const [label, message, body] of [
+    ['file read', completedOnlyMessage, '127.0.0.1 localhost'],
+    ['diff', editBetweenRunsMessage, 'added line']
+  ] as const) {
+    it(`folds an explicitly opened ${label} again when history remounts`, async () => {
+      const first = render(<GroupHarness message={message()} />)
+      const toggle = await waitFor(() => {
+        const button = first.container.querySelector('[data-tool-row] button[aria-expanded="false"]')
+        expect(button).not.toBeNull()
+        return button as Element
+      })
+      fireEvent.click(toggle)
+      expect(await screen.findByText(body)).toBeTruthy()
+      first.unmount()
+      const second = render(<GroupHarness message={message()} />)
+      expect(second.container.querySelector('[data-tool-row][data-tool-open]')).toBeNull()
+      expect(screen.queryByText(body)).toBeNull()
+    })
+  }
+})
+
 describe('live tool run', () => {
   it('honors explicit disclosure across live updates and completion', async () => {
     const message = groupedPendingMessage()

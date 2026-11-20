@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 
 import { parseAnsi } from '@/lib/ansi'
@@ -114,6 +114,12 @@ it.each(Object.entries(receipts))(
     )
 
     if (receipt.changed) {
+      // Local fold policy: transcript references mount folded, so open this
+      // concrete disclosure explicitly before the live visibility check.
+      await waitFor(() =>
+        expect(liveUi.container.querySelector('[data-tool-row] button[aria-expanded]')).not.toBeNull()
+      )
+      fireEvent.click(liveUi.container.querySelector('[data-tool-row] button[aria-expanded]')!)
       await waitFor(() => expect(liveUi.container.querySelector('[data-tool-row][data-file-edit]')).not.toBeNull())
     }
 
@@ -143,6 +149,15 @@ it.each(Object.entries(receipts))(
             <Thread />
           </ThreadRuntime>
         )
+
+        if (receipt.changed) {
+          // Same explicit open for the cold/reloaded render: the folded default
+          // must not stop the hydration assertions from seeing rendered content.
+          await waitFor(() =>
+            expect(ui.container.querySelector('[data-tool-row] button[aria-expanded]')).not.toBeNull()
+          )
+          fireEvent.click(ui.container.querySelector('[data-tool-row] button[aria-expanded]')!)
+        }
 
         await waitFor(() => {
           expect(Boolean(ui.container.querySelector('[data-tool-row][data-file-edit]'))).toBe(receipt.changed)
