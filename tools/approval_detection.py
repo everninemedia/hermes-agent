@@ -1873,6 +1873,20 @@ def _quoted_text_is_executed(variant: str, pattern_re: "re.Pattern[str] | _PipeR
 
 
 def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = None):
+    """:func:`_iter_matched_descriptions` with the plain `git push` finding held back to the end: only a
+    later detection variant shows some force pushes (`git push -o ci\\;skip -f`), and every more
+    specific finding must lead (the first one is the explanation the user sees)."""
+    plain_push = False
+    for description in _iter_matched_descriptions(command, only):
+        if description == _GIT_PUSH_DESCRIPTION:
+            plain_push = True
+        else:
+            yield description
+    if plain_push:
+        yield _GIT_PUSH_DESCRIPTION
+
+
+def _iter_matched_descriptions(command: str, only: frozenset[str] | None = None):
     """Yield the description (= pattern key) of every dangerous match, in detection order; may repeat.
     *only* restricts the scan to those pattern rules and skips the parser-limit, execution-flag and
     gateway-splice checks, which no content rule is."""
@@ -1890,7 +1904,6 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
         (pattern_re, description) for pattern_re, description in DANGEROUS_PATTERNS_COMPILED if description in only
     ]
     capped: list[str] = []
-    plain_push = False
     for command_variant in _command_detection_variants(command, capped=capped):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
@@ -1911,13 +1924,7 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
                 if any(_upload_flag_owned_by_curl_or_wget(owner_ranges, match.start()) for match in matches):
                     yield description
             elif pattern_re.search(command_lower):
-                if description == _GIT_PUSH_DESCRIPTION:
-                    # Held back: only a later variant shows some force pushes (`git push -o ci\;skip -f`).
-                    plain_push = True
-                else:
-                    yield description
-    if plain_push:
-        yield _GIT_PUSH_DESCRIPTION
+                yield description
     if capped and only is None:
         yield _PARSER_LIMIT_DESCRIPTION
     if only is not None:
