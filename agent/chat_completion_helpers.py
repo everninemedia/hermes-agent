@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent import chat_completion_helpers_closeout as _closeout
 from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
     _extract_status_code)
@@ -2159,12 +2160,9 @@ def _summary_text(agent, response, **normalize_kwargs) -> str:
 
 def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
     def _attempt(retry_count: int) -> str:
-        codex_kwargs = agent._build_api_kwargs(api_messages)
         # The transport emits these three as one block (transports/codex.py build_kwargs);
         # strict Responses backends 400 on tool_choice/parallel_tool_calls without tools.
-        codex_kwargs.pop("tools", None)
-        codex_kwargs.pop("tool_choice", None)
-        codex_kwargs.pop("parallel_tool_calls", None)
+        codex_kwargs = _closeout._force_toolless_request(agent._build_api_kwargs(api_messages))
         # Route through the same seam as normal Codex turns: a direct _run_codex_stream
         # bypasses the stale/TTFB watchdogs, interrupt handling and client cleanup, so an
         # unattended cron summary could wedge forever (#70943).
@@ -2178,7 +2176,7 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
             model=agent.model, messages=api_messages, tools=None, max_tokens=agent.max_tokens,
             reasoning_config=agent.reasoning_config, is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(), base_url=getattr(agent, "_anthropic_base_url", None))
-        ant_kw = _merge_nous_portal_messages_extra_body(agent, ant_kw, api_messages)
+        ant_kw = _closeout._force_toolless_request(_merge_nous_portal_messages_extra_body(agent, ant_kw, api_messages))
         response = _managed_summary_call(
             agent, api_request_id, ant_kw, agent._interruptible_api_call, retry_count=retry_count)
         return _summary_text(agent, response, strip_tool_prefix=agent._is_anthropic_oauth)
@@ -2247,6 +2245,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 append_message(messages, {"role": "assistant", "content": text})
                 final_response = text
             break
+        if final_response == _EMPTY_SUMMARY_RESPONSE:
+            append_message(messages, {"role": "assistant", "content": final_response})
 
     except InterruptedError:
         # Cancellation is not a summary failure: drop the unanswered nudge and let the
@@ -2257,8 +2257,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         raise
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
-        from agent.turn_failure_copy import site_copy
-        final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
+        final_response = _closeout._local_iteration_checkpoint(messages, agent.max_iterations, e)
+        append_message(messages, {"role": "assistant", "content": final_response})
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)

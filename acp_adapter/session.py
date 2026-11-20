@@ -537,6 +537,7 @@ class SessionManager:
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load an ACP session from the database into memory, recreating the AIAgent."""
         from persistence.conversation.messages import ConversationRequest
+        from persistence.gateway.routing import resume_route
         persistence = self._get_persistence()
         if persistence is None:
             return None
@@ -558,7 +559,14 @@ class SessionManager:
                 logger.debug("Failed to reopen ACP session %s", session_id, exc_info=True)
 
         meta = dict(row.model_config)
-        cwd, model = meta.get("cwd", "."), row.model or None
+        cwd = meta.get("cwd", ".")
+        # The reader CLI --resume and the TUI share: model and route come from ONE record, so the
+        # billing columns (which name whatever served the model column) never fill another
+        # model's provider, and a nested ``gateway_runtime`` route wins over stale top-level keys.
+        stored_model, route = resume_route(
+            meta, model=row.model, billing_provider=row.billing_provider,
+            billing_base_url=row.billing_base_url)
+        model = stored_model or None
 
         # repair_alternation: this list becomes the resumed agent's LIVE conversation; a durable
         # ``user;user`` violation in state.db would otherwise re-fire the pre-request repair every request.
@@ -571,9 +579,8 @@ class SessionManager:
 
         try:
             agent = self._make_agent(
-                session_id=session_id, cwd=cwd, model=model, api_mode=meta.get("api_mode") or None,
-                requested_provider=meta.get("provider") or row.billing_provider,
-                base_url=meta.get("base_url") or row.billing_base_url)
+                session_id=session_id, cwd=cwd, model=model, api_mode=route.api_mode or None,
+                requested_provider=route.provider or None, base_url=route.base_url or None)
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None

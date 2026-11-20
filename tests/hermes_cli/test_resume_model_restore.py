@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import cli as cli_mod
 from persistence.conversation.sessions import parse_model_config
-from persistence.gateway.routing import GatewayRuntime, gateway_runtime
+from persistence.gateway.routing import GatewayRuntime, gateway_runtime, resume_route
 from tests.fixtures.storage_read import session_row
 from tests.fixtures.storage_seed import seed_session
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
@@ -569,3 +569,83 @@ def test_stored_session_route_heals_an_empty_provider_row_unless_the_main_slot_s
     assert stored_session_route(stamped, current_model="claude-opus-5-5", current_provider="anthropic")[:4] == (
         "GLM-5.3", "custom:glm", None, None)
     assert stored_session_route(_row(model="claude-opus-5-5"), current_model="x", current_provider="anthropic")[1] is None
+
+
+# ── resume_route: the provider belongs to the model it is paired with ─────
+# Row shapes measured in the local profile databases (billing axis vs config axis).
+
+_LUNA = "gpt-5.6-luna"
+_CODEX_URL = "https://chatgpt.com/backend-api/codex/"
+_XAI_URL = "https://api.x.ai/v1"
+_CODEX_ROUTE = GatewayRuntime(provider="openai-codex", base_url=_CODEX_URL, api_mode="codex_responses")
+
+
+def _resume(meta):
+    """The ``(model, route)`` resume reads off a session row dict."""
+    return resume_route(meta.get("model_config"), model=meta.get("model"),
+                        billing_provider=meta.get("billing_provider"),
+                        billing_base_url=meta.get("billing_base_url"))
+
+
+def test_resume_route_config_axis_owns_the_session_model_over_a_stale_billing_axis():
+    """Config and column name the same model; the billing columns name another provider's route."""
+    meta = {
+        "model": _LUNA, "billing_provider": "xai-oauth", "billing_base_url": _XAI_URL,
+        "model_config": json.dumps({"model": _LUNA, "provider": "openai-codex", "base_url": _CODEX_URL,
+                                    "api_mode": "codex_responses"}),
+    }
+    assert _resume(meta) == (_LUNA, _CODEX_ROUTE)
+
+
+def test_resume_route_nested_route_without_a_model_stamp_owns_the_column_model():
+    """A gateway row from before the model stamp: only ``gateway_runtime``, written with the column."""
+    meta = {
+        "model": _LUNA, "billing_provider": "xai-oauth", "billing_base_url": _XAI_URL,
+        "model_config": json.dumps({"gateway_runtime": {
+            "provider": "openai-codex", "base_url": _CODEX_URL, "api_mode": "codex_responses",
+            "fallback_active": True}}),
+    }
+    assert _resume(meta) == (_LUNA, _CODEX_ROUTE)
+
+
+def test_resume_route_nested_route_outranks_a_stale_top_level_pick():
+    """After a provider fallback the gateway rewrote ``gateway_runtime`` and the column, not the
+    top-level pick: the nested route still pairs with the column model, never the frozen billing axis."""
+    meta = {
+        "model": _LUNA, "billing_provider": "xai-oauth", "billing_base_url": _XAI_URL,
+        "model_config": json.dumps({"model": "grok-4.6", "provider": "xai-oauth", "gateway_runtime": {
+            "provider": "openai-codex", "base_url": _CODEX_URL, "api_mode": "codex_responses",
+            "fallback_active": True}}),
+    }
+    assert _resume(meta) == (_LUNA, _CODEX_ROUTE)
+
+
+def test_resume_route_never_pairs_the_column_model_with_the_picked_provider():
+    """The reported 404 loop: the column moved to the fallback that served (Luna on Codex) while
+    ``model_config`` kept the pick (grok-4.6 on xai-oauth). Resume returns the pick as a pair; the
+    billing route served the column's model and fills nothing, and ``billing_mode`` is never a wire."""
+    meta = {
+        "model": _LUNA, "billing_provider": "openai-codex", "billing_base_url": _CODEX_URL,
+        "billing_mode": "subscription_included",
+        "model_config": json.dumps({"model": "grok-4.6", "provider": "xai-oauth"}),
+    }
+    assert _resume(meta) == ("grok-4.6", GatewayRuntime(provider="xai-oauth"))
+
+
+def test_resume_route_supplements_a_missing_provider_from_the_billing_axis():
+    """The config axis kept base_url/api_mode but lost its provider; the billing provider served the
+    same model, so it supplies the identity without replacing the stored endpoint."""
+    meta = {
+        "model": _LUNA, "billing_provider": "openai-codex",
+        "model_config": json.dumps({"base_url": _CODEX_URL, "api_mode": "codex_responses"}),
+    }
+    assert _resume(meta) == (_LUNA, _CODEX_ROUTE)
+
+
+def test_resume_route_empty_session_model_is_not_a_conflict():
+    """No column model means nothing to be stale against: the pick and its provider stand."""
+    meta = {
+        "model": "", "billing_provider": "openai-codex", "billing_base_url": _CODEX_URL,
+        "model_config": json.dumps({"model": "grok-4.6", "provider": "xai-oauth"}),
+    }
+    assert _resume(meta) == ("grok-4.6", GatewayRuntime(provider="xai-oauth"))
