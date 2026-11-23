@@ -93,3 +93,30 @@ describe('isLikelyProseFence', () => {
     ).toBe(true)
   })
 })
+
+describe('copy fences (opt-in copy blocks)', async () => {
+  const { HANDOVER_BLOCK } = await import('./copy-fence.fixture')
+  const { isCopyFenceLanguage } = await import('./markdown-code')
+
+  it('never treats copy / prompt / handoff fences as prose', () => {
+    for (const language of ['copy', 'prompt', 'handoff', 'Copy']) {
+      expect(isCopyFenceLanguage(language)).toBe(true)
+      expect(isLikelyProseFence(language, HANDOVER_BLOCK)).toBe(false)
+      expect(isLikelyProseCodeBlock(language, HANDOVER_BLOCK)).toBe(false)
+    }
+  })
+
+  it('wins over the info-tail and bullet heuristics', () => {
+    const bullets = '- **Erstens** ein Punkt mit Text.\n- **Zweitens** noch ein Punkt.'
+    expect(isLikelyProseFence('copy Übergabe an Claude Code', HANDOVER_BLOCK)).toBe(false)
+    expect(isLikelyProseCodeBlock('copy', bullets)).toBe(false)
+  })
+
+  it('leaves the text fence heuristic unchanged (regression)', () => {
+    expect(isCopyFenceLanguage('text')).toBe(false)
+    expect(isLikelyProseFence('text', HANDOVER_BLOCK)).toBe(true)
+    expect(isLikelyProseFence('', HANDOVER_BLOCK)).toBe(true)
+    expect(isLikelyProseCodeBlock('text', HANDOVER_BLOCK)).toBe(true)
+    expect(isLikelyProseCodeBlock('txt', HANDOVER_BLOCK)).toBe(true)
+  })
+})

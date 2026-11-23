@@ -13,7 +13,7 @@ import { SHIKI_COLOR_REPLACEMENTS } from '@/components/chat/shiki-config'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
 import { hostHas } from '@/lib/host-capabilities'
-import { isLikelyProseCodeBlock } from '@/lib/markdown-code'
+import { isCopyFenceLanguage, isLikelyProseCodeBlock } from '@/lib/markdown-code'
 
 import type { CachedShikiBlockProps } from './shiki-block'
 import { isChunkLoadError, ShikiChunkBoundary } from './shiki-chunk-boundary'
@@ -134,18 +134,19 @@ export function chunkByLines(code: string, perChunk: number): CodeChunk[] {
   return chunks
 }
 
-const PlainCode: FC<{ code: string }> = ({ code }) => {
+const PlainCode: FC<{ code: string; wrap?: boolean }> = ({ code, wrap = false }) => {
   const chunks = useMemo(() => chunkByLines(code, CHUNK_LINES), [code])
+  const whitespace = wrap ? 'whitespace-pre-wrap wrap-anywhere' : 'whitespace-pre'
 
   if (chunks.length === 1) {
-    return <code className="block whitespace-pre">{code}</code>
+    return <code className={`block ${whitespace}`}>{code}</code>
   }
 
   return (
     <>
       {chunks.map((chunk, index) => (
         <code
-          className="block whitespace-pre [content-visibility:auto]"
+          className={`block ${whitespace} [content-visibility:auto]`}
           key={index}
           style={{ containIntrinsicSize: `auto ${chunk.lines * EST_LINE_PX}px` }}
         >
@@ -183,6 +184,35 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
 
   if (isLikelyProseCodeBlock(language, content)) {
     return <div className="aui-prose-fence whitespace-pre-wrap wrap-anywhere text-foreground">{content}</div>
+  }
+
+  // ```copy / ```prompt / ```handoff: an intentional copy block. Always a card,
+  // never highlighted, wrapped so long prompt lines stay readable, and the
+  // copy control stays visible instead of appearing on hover only.
+  if (isCopyFenceLanguage(language)) {
+    // The parser hands the body over with the fence's own line break; drop
+    // exactly that one so the clipboard matches the authored block.
+    const block = content.endsWith('\n') ? content.slice(0, -1) : content
+
+    return (
+      <CodeCard data-copy-fence="true" data-streaming={defer ? 'true' : undefined}>
+        <CopyButton
+          appearance="inline"
+          className="absolute right-4 top-1.5 z-10 h-5 gap-0 rounded-md px-1"
+          iconClassName="size-3"
+          label={t.assistant.tool.copyCode}
+          showLabel={false}
+          text={() => copyableCodeText(block)}
+        />
+        <CodeCardBody className="[&_pre]:py-2.5 [&_pre]:pl-3 [&_pre]:pr-10">
+          <ExpandableBlock>
+            <Pre className="aui-shiki m-0 bg-transparent p-0">
+              <PlainCode code={block} wrap />
+            </Pre>
+          </ExpandableBlock>
+        </CodeCardBody>
+      </CodeCard>
+    )
   }
 
   const plain = defer || exceedsHighlightBudget(content)

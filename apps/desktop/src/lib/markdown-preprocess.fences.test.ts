@@ -30,3 +30,24 @@ describe('fenced code segmentation', () => {
     }
   })
 })
+
+describe('copy fences survive preprocessing', async () => {
+  const { HANDOVER_BLOCK } = await import('./copy-fence.fixture')
+
+  it('keeps a closed ```copy fence with five prose lines as a fence', () => {
+    const out = preprocessMarkdown(`Hier die Übergabe:\n\n\`\`\`copy\n${HANDOVER_BLOCK}\n\`\`\`\n\nDanach weiter.`)
+    expect(out).toContain(`\`\`\`copy\n${HANDOVER_BLOCK}\n\`\`\``)
+    expect(out.split('\n')).not.toContain('copy')
+  })
+
+  it('keeps a still-streaming ```copy fence as a fence', () => {
+    const out = preprocessMarkdown(`\`\`\`copy\n${HANDOVER_BLOCK}`)
+    expect(out.startsWith('```copy\n')).toBe(true)
+  })
+
+  it('still unwraps the same prose in a ```text fence (regression)', () => {
+    const out = preprocessMarkdown(`\`\`\`text\n${HANDOVER_BLOCK}\n\`\`\``)
+    expect(out).not.toContain('```')
+    expect(out.split('\n')[0]).toBe('text')
+  })
+})

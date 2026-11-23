@@ -2,6 +2,9 @@ import { normalize } from '@/lib/text'
 
 const VALID_LANGUAGE_RE = /^[a-z0-9][a-z0-9+#-]*$/i
 const NON_CODE_FENCE_LANGUAGES = new Set(['', 'text', 'plain', 'plaintext', 'md', 'markdown'])
+// Opt-in copy blocks (handover prompts, briefings): the author asked for a
+// copyable card on purpose, so the prose heuristics below never unwrap them.
+const COPY_FENCE_LANGUAGES = new Set(['copy', 'prompt', 'handoff'])
 
 const COMMON_CODE_LANGUAGES = new Set([
   'bash',
@@ -336,7 +339,16 @@ export function isLikelyStructuredText(body: string): boolean {
   return configLines >= Math.max(2, Math.ceil(lines.length * 0.6))
 }
 
+/** True when the fence language opts into an always-copyable block. */
+export function isCopyFenceLanguage(language: string | undefined): boolean {
+  return COPY_FENCE_LANGUAGES.has(sanitizeLanguageTag(language || ''))
+}
+
 export function isLikelyProseFence(info: string, body: string): boolean {
+  if (isCopyFenceLanguage(info)) {
+    return false
+  }
+
   const trimmedInfo = info.trim()
   const rawInfo = trimmedInfo.toLowerCase()
   const language = sanitizeLanguageTag(info)
@@ -379,6 +391,10 @@ export function isLikelyProseFence(info: string, body: string): boolean {
 }
 
 export function isLikelyProseCodeBlock(language: string | undefined, code: string | undefined): boolean {
+  if (isCopyFenceLanguage(language)) {
+    return false
+  }
+
   const cleanLanguage = sanitizeLanguageTag(language || '')
   const signals = codeSignals(code || '')
 
