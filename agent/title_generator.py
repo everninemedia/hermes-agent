@@ -139,6 +139,10 @@ _TITLE_PROMPT_TEMPLATE = (
 
 _LENGTH_RULE_DEFAULT = "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns)."
 _LENGTH_RULE_CAPPED = "- At most {max_words} words, sentence case (capitalize only the first word and proper nouns)."
+_TITLE_RETRY_TEMPLATE = (
+    "That title has {count} words. Rewrite it in at most {max_words} words, same language, "
+    'same topic. Reply with JSON only: {{"title": "..."}}'
+)
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
 
@@ -682,9 +686,10 @@ def generate_title(
         # and reject explicit temperature values, causing the daemon title
         # thread to fail with "Unsupported value: 'temperature'".
         # See: #72351, #51083, #51157
-        response = call_llm(
+        messages = [{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}]
+        request = lambda: call_llm(  # one request shape, sent at most twice
             task="title_generation",
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_snippet}],
+            messages=messages,
             # A title is a handful of tokens, but 64 was cut mid-JSON by fenced/prefixed replies and by
             # reasoning models whose thinking survives the disable below (#83903, #82291). A model that
             # honours the JSON contract stops after ~15 tokens regardless, so the ceiling only costs on
@@ -700,9 +705,25 @@ def generate_title(
             # ("```json") as the session title (#91927).
             reasoning_config={"enabled": False},
         )
-        message = response.choices[0].message
+        message = request().choices[0].message
         raw_title = _extract_title_text(message.content or "") or _title_from_reasoning(message)
         title = _clean_title(raw_title, user_snippet)
+        # Over the configured cap: ask once more with the count spelled out, so the model shortens its
+        # own title instead of losing its tail to the cut below. One retry only; a failed or still too
+        # long second answer keeps the first title for the cut.
+        if title is not None and max_words and len(title.split()) > max_words and not _is_answer_shaped(" ".join(raw_title.split())):
+            try:
+                messages += [
+                    {"role": "assistant", "content": json.dumps({"title": title}, ensure_ascii=False)},
+                    {"role": "user", "content": _TITLE_RETRY_TEMPLATE.format(count=len(title.split()), max_words=max_words)},
+                ]
+                retry = request().choices[0].message
+                retry_raw = _extract_title_text(retry.content or "") or _title_from_reasoning(retry)
+                shorter = _clean_title(retry_raw, user_snippet)
+                if shorter and len(shorter.split()) <= max_words and not _is_prompt_example_echo(shorter):
+                    raw_title, title = retry_raw, shorter
+            except Exception:
+                logger.debug("Title shortening retry failed; cutting the first title", exc_info=True)
         # Answer-shaped output guard: titling is a 3-7 word task, so a title with many words is a model that
         # ignored the task and answered the user's message instead ("I don't have context on X — that's not
         # something I recognize..."). Truncating would store half an assistant blob as the session title,

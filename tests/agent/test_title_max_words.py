@@ -13,14 +13,20 @@ def _config(**title_generation):
     return patch("hermes_cli.config.load_config_readonly", return_value=cfg)
 
 
-def _reply(title):
+def _reply(*titles):
+    """Fake ``call_llm`` answering with ``titles`` in order (the last one repeats); an Exception is raised."""
     def call(**kwargs):
         call.kwargs = kwargs
+        call.count += 1
+        title = titles[min(call.count, len(titles)) - 1]
+        if isinstance(title, Exception):
+            raise title
         resp = MagicMock()
         resp.choices = [MagicMock()]
         resp.choices[0].message.content = json.dumps({"title": title})
         return resp
 
+    call.count = 0
     return call
 
 
@@ -39,6 +45,7 @@ def test_max_words_unset_keeps_the_default_prompt_and_title():
     call = _reply("Sales und VOE mit Logging starten")
     with _config(), patch("agent.title_generator.call_llm", side_effect=call):
         assert generate_title("Starte Sales und VOE mit Logging") == "Sales und VOE mit Logging starten"
+    assert call.count == 1
 
 
 def test_capped_prompt_states_the_cap_and_drops_longer_examples():
@@ -57,6 +64,23 @@ def test_capped_title_is_cut_to_the_cap():
     with _config(max_words=3), patch("agent.title_generator.call_llm", side_effect=call):
         assert generate_title("Starte Sales und VOE mit Logging") == "Sales und VOE"
     assert "- At most 3 words" in call.kwargs["messages"][0]["content"]
+    assert call.count == 2
+
+
+def test_too_long_title_is_shortened_by_the_model_before_any_cut():
+    call = _reply("Sales und VOE mit Logging starten", "Sales VOE Logging")
+    with _config(max_words=3), patch("agent.title_generator.call_llm", side_effect=call):
+        assert generate_title("Starte Sales und VOE mit Logging") == "Sales VOE Logging"
+    assert call.count == 2
+    retry = call.kwargs["messages"]
+    assert json.loads(retry[-2]["content"]) == {"title": "Sales und VOE mit Logging starten"}
+    assert "has 6 words" in retry[-1]["content"] and "at most 3 words" in retry[-1]["content"]
+
+
+def test_failed_retry_falls_back_to_the_cut_first_title():
+    call = _reply("Sales und VOE mit Logging starten", RuntimeError("provider down"))
+    with _config(max_words=3), patch("agent.title_generator.call_llm", side_effect=call):
+        assert generate_title("Starte Sales und VOE mit Logging") == "Sales und VOE"
 
 
 def test_cut_leaves_no_dangling_separator():
@@ -69,3 +93,4 @@ def test_title_within_the_cap_is_unchanged():
     call = _reply("CRM Kontakte Logging")
     with _config(max_words=3), patch("agent.title_generator.call_llm", side_effect=call):
         assert generate_title("Logge die CRM Kontakte") == "CRM Kontakte Logging"
+    assert call.count == 1
