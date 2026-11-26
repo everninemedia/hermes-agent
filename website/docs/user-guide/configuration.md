@@ -1652,6 +1652,13 @@ No background `auto-title` thread starts and no automatic title-model request is
 explicit repair command `hermes sessions retitle-skills` still calls the model. `enabled: false`
 still disables both stages.
 
+Set `auxiliary.title_generation.compact_date_timezone` to an IANA timezone such as
+`Europe/Berlin` for short automatic conversation titles: one or two topic words and
+the session's local start date in `YYMMDD` format (for example, `ERP Optimierung 261126`).
+In this mode the compact prompt replaces the usual language and word-count settings.
+If the title is already taken, a number is attached to the topic (`ERP Optimierung#2 261126`).
+Existing and manual titles are not renamed. The default (empty string) keeps normal titling.
+
 On a `custom` main provider (llama.cpp, Ollama, vLLM, LM Studio and other self-hosted
 OpenAI-compatible servers) the title model call is sent **after** the turn's reply has
 arrived, not concurrently with it, unless `auxiliary.title_generation` is pinned to another

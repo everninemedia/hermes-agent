@@ -15,7 +15,9 @@ import time
 import unicodedata
 import weakref
 from contextlib import suppress
+from datetime import datetime
 from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
@@ -139,6 +141,17 @@ _TITLE_PROMPT_TEMPLATE = (
 
 _LENGTH_RULE_DEFAULT = "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns)."
 _LENGTH_RULE_CAPPED = "- At most {max_words} words, sentence case (capitalize only the first word and proper nouns)."
+_COMPACT_DATED_PROMPT = (
+    "Name the user's main topic or goal for a session list.\n"
+    "At most 2 words; use one when it identifies the topic. Pick the most recognizable subject, "
+    "adding the goal only if useful. Avoid filler, generic verbs, and labels like 'Task'. "
+    "Use German with real umlauts where appropriate; keep recognizable English terms, acronyms, "
+    "brand names and hyphens as written. Do not add a date; the app adds it. "
+    "For a bare greeting alone, return exactly Friendly greeting. Never answer the message.\n"
+    'Reply with JSON only: {"title": "..."}'
+)
+_COMPACT_TOPIC_MAX_WORDS = 2
+_SIX_DIGITS = re.compile(r"[0-9]{6}")
 _TITLE_RETRY_TEMPLATE = (
     "That title has {count} words. Rewrite it in at most {max_words} words, same language, "
     'same topic. Reply with JSON only: {{"title": "..."}}'
@@ -201,6 +214,38 @@ def _title_max_words() -> int:
     except Exception:
         return 0
     return cap if 1 <= cap <= _MAX_TITLE_WORDS else 0
+
+
+def _compact_date_zone() -> ZoneInfo | None:
+    try:
+        name = _title_config().get("compact_date_timezone")
+        return ZoneInfo(name) if isinstance(name, str) and name else None
+    except (ValueError, ZoneInfoNotFoundError):
+        logger.debug("Invalid timezone for compact session titles", exc_info=True)
+        return None
+
+
+def _title_date(session_db, session_id, persistence) -> str:
+    zone = _compact_date_zone()
+    if zone is None:
+        return ""
+    if persistence is not None:
+        record = persistence.sessions.get(session_id)
+        started = record.started_at if record is not None else None
+    else:
+        getter = getattr(session_db, "get_session", None)
+        row = getter(session_id) if getter is not None else None
+        started = row.get("started_at") if isinstance(row, dict) else None
+    return (datetime.fromtimestamp(started, zone) if started is not None else datetime.now(zone)).strftime("%y%m%d")
+
+
+def _compact_model_topic(title: str, source: str) -> str | None:
+    words = title.split()
+    while words and _SIX_DIGITS.fullmatch(words[-1]):
+        if re.search(rf"(?<![0-9]){words[-1]}(?![0-9])", source):
+            break  # A reference the user supplied is not a model-invented suffix.
+        words.pop()
+    return " ".join(words) or None
 
 
 def _build_title_prompt(language: str = "", max_words: int = 0) -> str:
@@ -678,8 +723,9 @@ def generate_title(
         not title_preview and _attachment_only_opener(user_snippet)
     ):
         return None
-    max_words = _title_max_words()
-    prompt = _build_title_prompt(_title_language(), max_words)
+    compact = _compact_date_zone() is not None
+    max_words = _COMPACT_TOPIC_MAX_WORDS if compact else _title_max_words()
+    prompt = _COMPACT_DATED_PROMPT if compact else _build_title_prompt(_title_language(), max_words)
     try:
         # Use the provider's default temperature instead of forcing 0.3.
         # Some models (e.g. GPT-5.6) only accept their server-side default
@@ -708,6 +754,8 @@ def generate_title(
         message = request().choices[0].message
         raw_title = _extract_title_text(message.content or "") or _title_from_reasoning(message)
         title = _clean_title(raw_title, user_snippet)
+        if compact and title:
+            title = _compact_model_topic(title, user_snippet)
         # Over the configured cap: ask once more with the count spelled out, so the model shortens its
         # own title instead of losing its tail to the cut below. One retry only; a failed or still too
         # long second answer keeps the first title for the cut.
@@ -720,6 +768,8 @@ def generate_title(
                 retry = request().choices[0].message
                 retry_raw = _extract_title_text(retry.content or "") or _title_from_reasoning(retry)
                 shorter = _clean_title(retry_raw, user_snippet)
+                if compact and shorter:
+                    shorter = _compact_model_topic(shorter, user_snippet)
                 if shorter and len(shorter.split()) <= max_words and not _is_prompt_example_echo(shorter):
                     raw_title, title = retry_raw, shorter
             except Exception:
@@ -771,7 +821,7 @@ def _has_upgraded_title(session_db, session_id: str, *, persistence=None) -> boo
         return True
 
 
-def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, persistence=None):
+def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, persistence=None, date_suffix=""):
     """Persist at *source* authority via ``set_auto_title`` (precedence check + write in one
     transaction, so a manual ``/title`` is never overwritten); None when a higher authority held the row.
     ``ValueError`` = unique-title index collision → append ``#N`` via ``get_next_title_in_lineage``;
@@ -802,6 +852,17 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
             raise RuntimeError(f"session {session_id} not found when storing title")
         return candidate
 
+    if date_suffix:
+        topic = _cap_title_words(title, _COMPACT_TOPIC_MAX_WORDS)
+        # The title store requires uniqueness. Keep the disambiguator attached to the
+        # topic so it neither becomes a third word nor moves the date out of last place.
+        for number in range(1, 101 if dedupe else 2):
+            index = f"#{number}" if number > 1 else ""
+            try:
+                return _set(f"{topic}{index} {date_suffix}")
+            except ValueError:
+                if not dedupe or number == 100:
+                    raise
     try:
         return _set(title)
     except ValueError:
@@ -841,6 +902,7 @@ def apply_instant_title(
         title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message) else None
         persisted = _persist_session_title(
             session_db, session_id, title, source="derived", dedupe=False, persistence=persistence,
+            date_suffix=_title_date(session_db, session_id, persistence),
         ) if title else None
         if persisted:
             _notify_title(title_callback, persisted, "derived", "Instant-title")
@@ -892,7 +954,10 @@ def auto_title_session(
         if not title:
             return
         try:
-            persisted = _persist_session_title(session_db, session_id, title, source=source, persistence=persistence)
+            persisted = _persist_session_title(
+                session_db, session_id, title, source=source, persistence=persistence,
+                date_suffix=_title_date(session_db, session_id, persistence),
+            )
         except Exception as e:
             logger.debug("Failed to set auto-generated title: %s", e)
             return
