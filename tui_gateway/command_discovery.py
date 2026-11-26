@@ -287,8 +287,15 @@ def slash_completions(text: str = "", scope=None) -> dict:
         # catalog entries whose name SUBSTRING or DESCRIPTION words match (name outranks description).
         if " " not in text and len(text) > 1:
             from tui_gateway.slash_fuzzy import fuzzy_rank_slash_items, normalize_slash_search_query
-            items, score_of = fuzzy_rank_slash_items(
-                items, to_items(Document("/", 1)), normalize_slash_search_query(text))
+            _q = normalize_slash_search_query(text)
+            items, score_of = fuzzy_rank_slash_items(items, to_items(Document("/", 1)), _q)
+            # EVM-LOKALPATCH 261123 (SoT infra/hermes/lokalpatches.md): Befehle, die nur über ihre
+            # Beschreibung passen, verdecken sonst Skills, deren NAME passt (Desktop gruppiert Commands
+            # immer zuerst). Passt ein Skill-Name, fallen reine Beschreibungs-Treffer bei Befehlen weg.
+            def _nm(item: dict) -> str:
+                return str(item.get("text", "")).strip().lstrip("/").lower()
+            if any(item.get("kind") == "skill" and _q in _nm(item) for item in items):
+                items = [item for item in items if item.get("kind") == "skill" or _q in _nm(item)]
         usage, origin_of = _skill_usage_lookup()
         items = _rank_slash_completions(items, usage, origin_of, browsing=text == "/", score_of=score_of)
     else:
