@@ -759,7 +759,6 @@ DEFAULT_CONFIG = {
         "title_generation": {
             "enabled": True,
             "model_upgrade_enabled": True,  # False = keep the instant derived title, never call a model
-            "compact_date_timezone": "",  # IANA timezone to opt into a two-word topic plus YYMMDD
             # session_search no longer uses an aux LLM (#27590); leftover auxiliary.session_search is ignored.
             "provider": "auto",
             "model": "",
@@ -769,7 +768,7 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
             "reasoning_effort": "",
-            "language": "",
+            "language": "", "compact_date_timezone": "",  # IANA zone: opt into a two-word topic plus YYMMDD
         },
         "memory_query_rewrite": _aux(8, reasoning_effort=False),
         "tts_audio_tags": _aux(30),

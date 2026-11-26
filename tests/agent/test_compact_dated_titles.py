@@ -1,7 +1,7 @@
 """Compact dated titles through Hermes' real session store."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,7 +23,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     with open_persistence(profile_scope(home=home)) as handle:
         # 23:30 UTC is already the next day in Berlin. Time of titling is deliberately not pinned.
-        started_at = datetime(2026, 11, 25, 23, 30, tzinfo=timezone.utc).timestamp()
+        started_at = datetime(2026, 11, 25, 23, 30, tzinfo=UTC).timestamp()
 
         def create(sid):
             with patch("time.time", return_value=started_at):

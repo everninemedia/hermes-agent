@@ -212,6 +212,7 @@ def _title_max_words() -> int:
             return 0
         cap = int(value)
     except Exception:
+        logger.debug("Unreadable auxiliary.title_generation.max_words", exc_info=True)
         return 0
     return cap if 1 <= cap <= _MAX_TITLE_WORDS else 0
 
