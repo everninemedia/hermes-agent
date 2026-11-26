@@ -147,7 +147,7 @@ class TestChatCFailLoudlyOnStderr:
 
         created = []
         monkeypatch.setattr(store_mod, "create_titled_session",
-                            lambda title: created.append(title) or "local-" + "a" * 64, raising=False)
+                            lambda title, launch=None: created.append(title) or "local-" + "a" * 64, raising=False)
         args = type(
             "Args",
             (),
@@ -163,6 +163,40 @@ class TestChatCFailLoudlyOnStderr:
         assert args.resume == "local-" + "a" * 64, "resume should be set to the new session id"
         assert created == ["Bot Chat"]
         assert not (isolated_home / "state.db").exists(), "the CLI must not write the titled row itself"
+
+    def test_create_if_missing_freezes_the_launch_flags(self, isolated_home, monkeypatch):
+        """R48 (local fork fix): ``-c NAME --create-if-missing --max-turns 40 --run-budget 1800 -m X``
+        hands its launch flags to the titled create, so the resume that follows finds them frozen
+        instead of refusing "creation overrides are unsupported on resume"."""
+        import hermes_cli.main as main_mod
+        import hermes_cli.gateway_session_store as store_mod
+
+        seen = []
+        monkeypatch.setattr(store_mod, "create_titled_session",
+                            lambda title, launch=None: seen.append(launch) or "local-" + "c" * 64, raising=False)
+        args = type("Args", (), {"continue_last": "Kind 261126", "resume": None, "create_if_missing": True,
+                                 "max_turns": 40, "run_budget": 1800.0, "model": "glm-5.3-flash",
+                                 "provider": "zai"})()
+        main_mod._resolve_continue_arg(args, use_tui=False)
+
+        assert args.resume == "local-" + "c" * 64
+        launch = seen[0]
+        assert launch["max_turns"] == 40 and launch["run_budget"] == 1800.0
+        assert launch["model"] == "glm-5.3-flash" and launch["provider"] == "zai"
+        assert launch["toolsets"] is None and launch["verbose"] is None
+
+    def test_create_if_missing_without_flags_sends_no_overrides(self, isolated_home, monkeypatch):
+        """Unset flags stay unset: the gateway keeps resolving the profile default."""
+        import hermes_cli.main as main_mod
+        import hermes_cli.gateway_session_store as store_mod
+
+        seen = []
+        monkeypatch.setattr(store_mod, "create_titled_session",
+                            lambda title, launch=None: seen.append(launch) or "local-" + "d" * 64, raising=False)
+        args = type("Args", (), {"continue_last": "Plain", "resume": None, "create_if_missing": True,
+                                 "provider": "zai"})()
+        main_mod._resolve_continue_arg(args, use_tui=False)
+        assert all(value is None for value in seen[0].values())
 
     def test_tui_create_if_missing_keeps_the_local_titled_row(self, isolated_home):
         """The TUI launch is unchanged: main's titled row, then the TUI resumes it."""

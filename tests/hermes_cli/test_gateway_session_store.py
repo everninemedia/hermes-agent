@@ -466,6 +466,23 @@ def test_create_if_missing_titles_a_gateway_created_session(store, monkeypatch):
     assert params["title"] == "Fresh Named" and params["source"] and params["cwd"]
 
 
+def test_create_if_missing_freezes_launch_flags_the_resume_then_accepts(store, monkeypatch):
+    """R48 (local fork fix): the titled create carries the launch flags, so the classic CLI's resume
+    check against the frozen route passes; the old flagless create is the refusal it replaces."""
+    db, client = store
+    from hermes_cli import gateway_session_store as gss
+    from hermes_cli.gateway_client import GatewayClientError
+    monkeypatch.setattr(gss, "session_store", lambda: db)
+    launch = {"max_turns": 40, "run_budget": 1800.0}
+    assert gss.create_titled_session("Kind 261126", launch) == "local-new"
+    _method, params = [c for c in client.calls if c[0] == "session.create"][-1]
+    assert params["max_turns"] == 40 and params["run_budget"] == 1800.0 and params["title"] == "Kind 261126"
+    frozen = {key: params[key] for key in ("max_turns", "run_budget")}
+    gss._check_resume_launch(launch, {"info": {"launch_request": frozen}})
+    with pytest.raises(GatewayClientError, match="creation overrides are unsupported on resume"):
+        gss._check_resume_launch(launch, {"info": {"launch_request": {}}})
+
+
 def test_bare_continue_finds_the_last_session_the_cli_created(tmp_path, monkeypatch):
     """Bare ``-c`` (main.py ``_resolve_last_session``) reads main's labels too: a gateway row labelled
     ``local`` that the CLI created is CLI history."""

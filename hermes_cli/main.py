@@ -1238,6 +1238,28 @@ def _create_titled_session(title: str) -> Optional[str]:
         return None
 
 
+def _titled_session_launch(args) -> dict:
+    """``chat -c <title> --create-if-missing``'s explicit launch flags, mapped as the classic CLI's
+    ``_gateway_launch`` maps them for ``session.create`` (local fork fix R48). The classic CLI resumes
+    the created session and checks these flags against its frozen route, so they must be frozen at
+    creation. ``-s`` stays out: the CLI drops ``skills.auto_load`` names first, which needs its
+    config; a typed ``-s`` therefore still meets the resume check as before."""
+    model = getattr(args, "model", None) or None
+    provider = getattr(args, "provider", None)
+    return {"model": model,
+            "provider": provider if model and provider not in {None, "", "auto"} else None,
+            "api_key": getattr(args, "api_key", None) or None,
+            "base_url": getattr(args, "base_url", None) or None,
+            "toolsets": getattr(args, "toolsets", None) or None,
+            "reasoning": getattr(args, "reasoning", None) or None,
+            "max_turns": getattr(args, "max_turns", None),
+            "checkpoints": getattr(args, "checkpoints", False) or None,
+            "pass_session_id": getattr(args, "pass_session_id", False) or None,
+            "ignore_rules": getattr(args, "ignore_rules", False) or None,
+            "run_budget": getattr(args, "run_budget", None),
+            "verbose": getattr(args, "verbose", False) or None}
+
+
 def _resolve_continue_arg(args, *, use_tui: bool) -> None:
     """Resolve ``-c/--continue`` into ``args.resume``.
 
@@ -1264,7 +1286,7 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                     new_sid = _create_titled_session(continue_val)
                 else:
                     from hermes_cli.gateway_session_store import create_titled_session
-                    new_sid = create_titled_session(continue_val)
+                    new_sid = create_titled_session(continue_val, _titled_session_launch(args))
                 if new_sid:
                     args.resume = new_sid
                 else:
